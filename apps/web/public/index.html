@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Token 潮汐——海洋科技公司的大模型用量排行榜" />
+    <title>Token 潮汐 · 连接采集器</title>
+    <link rel="stylesheet" href="/styles.css?v=0.2.0" />
+  </head>
+  <body>
+    <div class="ocean-glow"></div>
+    <header class="nav">
+      <a class="brand" href="/">Token 潮汐 <span>Token Tide</span></a>
+      <div class="user-status-area">
+        <span id="user-display-name">👤 本机用户</span>
+        <button id="edit-profile-btn" class="button ghost small">修改名称</button>
+        <button id="feishu-login-btn" class="button primary small">飞书登录</button>
+        <div class="health"><i></i> 本地开发版</div>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="eyebrow">让每一次模型调用汇成可见的潮汐</div>
+        <h1>三分钟，连接你的<br /><em>AI 探索装备</em></h1>
+        <p>默认单次采集、完成即退出。不读取提示词、代码、文件路径或密钥。</p>
+      </section>
+
+      <section class="connect-card">
+        <div class="card-head">
+          <div>
+            <span class="step-label">STEP 01</span>
+            <h2>选择你的操作系统</h2>
+          </div>
+          <span class="privacy-pill">只上传用量字段</span>
+        </div>
+
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-os="macOS"> macOS</button>
+          <button class="tab" data-os="Windows">⊞ Windows</button>
+          <button class="tab" data-os="Linux">◉ Linux</button>
+        </div>
+
+        <div class="setup-grid">
+          <div class="setup-option primary-option">
+            <span class="recommended">推荐 · 当前可运行</span>
+            <h3>终端命令</h3>
+            <p>先生成一次性配对码，再复制命令到任意终端目录运行。</p>
+            <button id="create-code" class="button primary">生成配对命令</button>
+          </div>
+          <div class="setup-option disabled-option">
+            <span class="coming">即将开放</span>
+            <h3>下载安装包</h3>
+            <p id="download-copy">下载已签名的 macOS 安装包，无需命令行。</p>
+            <button class="button ghost" disabled>准备中</button>
+          </div>
+        </div>
+
+        <div id="pairing" class="pairing hidden">
+          <div class="pairing-code">
+            <span>一次性配对码</span>
+            <strong id="code">—</strong>
+          </div>
+          <div class="command-wrap">
+            <code id="command"></code>
+            <button id="copy-command" class="copy">复制</button>
+          </div>
+
+          <div class="progress" aria-label="接入进度">
+            <div class="progress-item active" data-status="waiting"><b>1</b><span>等待运行</span></div>
+            <div class="line"></div>
+            <div class="progress-item" data-status="paired"><b>2</b><span>设备已配对</span></div>
+            <div class="line"></div>
+            <div class="progress-item" data-status="scanning"><b>3</b><span>正在扫描</span></div>
+            <div class="line"></div>
+            <div class="progress-item" data-status="uploaded"><b>4</b><span>数据已收到</span></div>
+            <div class="line"></div>
+            <div class="progress-item" data-status="aggregated"><b>5</b><span>排行已更新</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="receipt" class="receipt hidden">
+        <div class="animal">🪼</div>
+        <div class="receipt-title">
+          <span>首次潮汐已抵达</span>
+          <h2>上传校验成功</h2>
+        </div>
+        <div class="metric"><small>工具</small><strong id="receipt-tools">—</strong></div>
+        <div class="metric"><small>模型</small><strong id="receipt-models">—</strong></div>
+        <div class="metric"><small>Token</small><strong id="receipt-tokens">—</strong></div>
+        <a href="#leaderboard" class="button small">查看排行榜</a>
+      </section>
+
+      <section class="signature-panel">
+        <div class="section-head">
+          <div>
+            <span class="step-label">FEISHU SIGNATURE</span>
+            <h2>飞书签名与自动采集</h2>
+          </div>
+          <span id="signature-status" class="status-warn">尚未启用定时采集</span>
+        </div>
+
+        <div class="signature-grid">
+          <div class="signature-settings">
+            <label>定时任务设置</label>
+            <div class="collect-toggle-wrap">
+              <input type="checkbox" id="auto-collect" checked />
+              <label for="auto-collect">启用自动定时采集</label>
+            </div>
+            <button id="refresh-now" class="button primary small" style="width: fit-content; margin: 6px 0;">立即刷新数据</button>
+            <span id="refresh-stamp" class="hint" style="display:block;"></span>
+            <p class="hint">不想等定时？点一下立即重新拉取榜单、签名预览并推送到飞书。签名里的时间是「数据采集时间」，只有本机采集器（自动或手动 <code>token-tide sync</code>）上传新用量后才会前进。</p>
+
+            <label>签名显示内容</label>
+            <div class="choice-row" id="metric-choice">
+              <button class="choice active" data-value="today">今日 Token</button>
+              <button class="choice" data-value="total">累计 Token</button>
+            </div>
+            <p class="hint">今日模式建议每 30 分钟采集一次；累计模式建议每天一次。</p>
+
+            <label for="interval">采集频率</label>
+            <select id="interval">
+              <option value="30">每 30 分钟（今日推荐）</option>
+              <option value="360">每 6 小时</option>
+              <option value="1440">每天一次（累计推荐）</option>
+            </select>
+            <button id="save-signature" class="button primary">保存显示偏好</button>
+          </div>
+
+          <div class="signature-preview">
+            <span>签名预览</span>
+            <strong id="signature-copy">🐢 海龟 Lv.5｜今日 Token 待同步｜更新 —</strong>
+            
+            <button id="copy-signature-rich" class="button primary small" style="width: fit-content; margin-top: 4px;">复制飞书签名</button>
+            <button id="refresh-feishu-signature" class="button ghost small" style="width: fit-content; margin-top: 4px;">立即刷新飞书签名</button>
+            <button id="copy-signature-text" class="button ghost small" style="width: fit-content; margin-top: 4px;">复制纯文本</button>
+            
+            <div class="signature-url-wrap">
+              <span class="url-label">飞书签名 URL</span>
+              <div class="url-input-group">
+                <input type="text" id="signature-url" readonly value="" placeholder="加载中..." />
+                <button id="copy-signature-url" class="copy-btn">复制 URL</button>
+              </div>
+              <p class="warning-hint" style="color: var(--coral); font-size: 11px; margin-top: 6px; line-height: 1.4; opacity: 0.9;">
+                使用方式：点“复制飞书签名”，再到飞书个人签名框粘贴。不要直接复制下方裸 URL，否则飞书只会显示域名。
+              </p>
+            </div>
+
+            <p>推送方式：本地采集器 → HTTPS 上传 → 稳定签名 URL；飞书读取 URL 预览，通常有 5–10 分钟缓存。</p>
+          </div>
+
+          <div class="schedule-status">
+            <div><small>上次采集</small><strong id="last-collect">—</strong></div>
+            <div><small>下次采集</small><strong id="next-collect">未安排</strong></div>
+            <div><small>自动采集</small><strong id="scheduler-state">未启用</strong></div>
+            <div><small>飞书连接</small><strong id="feishu-state">待接入 OAuth</strong></div>
+          </div>
+        </div>
+
+        <div class="notice-line">
+          <b>关于定时自动采集说明</b>
+          系统默认已为您配置开启了 30 分钟定时自动采集偏好设置。您可以通过取消勾选“启用自动定时采集”并保存来取消该任务。
+        </div>
+      </section>
+
+      <section id="leaderboard" class="leaderboard">
+        <div class="section-head">
+          <div>
+            <span class="step-label">REAL LOCAL DATA</span>
+            <h2>模型潮汐榜<span id="board-period-label">（累计数据）</span></h2>
+          </div>
+          <div class="board-actions">
+            <div class="choice-row" id="board-period-choice">
+              <button class="choice active" data-period="total">累计数据</button>
+              <button class="choice" data-period="today">今日数据</button>
+            </div>
+            <button id="refresh-board" class="button ghost small">刷新</button>
+          </div>
+        </div>
+        <div id="board-empty" class="empty">完成首次上传后，这里会出现你的海洋伙伴。</div>
+        <div id="board"></div>
+      </section>
+    </main>
+
+    <footer>Token 潮汐 v0.1.0 · 本地纵向闭环原型</footer>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/app.js?v=0.2.1"></script>
+  </body>
+</html>

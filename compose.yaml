@@ -1,0 +1,15 @@
+services:
+  token-tide:
+    build: .
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      PUBLIC_BASE_URL: http://localhost:8787
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3

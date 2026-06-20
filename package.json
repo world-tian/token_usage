@@ -1,0 +1,24 @@
+{
+  "name": "token-tide",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --watch apps/server/src/server.mjs",
+    "start": "node --env-file-if-exists=.env apps/server/src/server.mjs",
+    "collector": "node apps/collector/src/cli.mjs",
+    "demo:sync": "node apps/collector/src/cli.mjs demo-sync",
+    "test": "node --test",
+    "check": "node --check apps/server/src/server.mjs && node --check apps/server/src/pricing.mjs && node --check apps/collector/src/cli.mjs && node --check apps/collector/src/adapters.mjs && node --check apps/web/public/app.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.67.0"
+  }
+}

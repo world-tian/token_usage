@@ -1,0 +1,13 @@
+node_modules/
+.DS_Store
+.env
+.env.*
+!.env.example
+coverage/
+dist/
+data/
+*.log
+apps/server/src/config.json
+apps/server/src/events.json
+apps/server/src/token-tide.db
+apps/server/src/token-tide.db-*
