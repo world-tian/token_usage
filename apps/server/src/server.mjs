@@ -199,11 +199,14 @@ function deleteSession(token) {
 function getSessionFromRequest(request) {
   const cookie = request.headers.cookie || '';
   const match = cookie.match(/(?:^|;\s*)tt_session=([^;]+)/);
-  return match ? getSession(decodeURIComponent(match[1])) : null;
+  if (!match) return null;
+  const session = getSession(decodeURIComponent(match[1]));
+  if (!session) console.log('[Auth] tt_session cookie found but session invalid/expired, token prefix:', match[1].slice(0, 16));
+  return session;
 }
 
 function sessionCookie(token, maxAge = 2592000) {
-  return `tt_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Max-Age=${maxAge}; Path=/`;
+  return `tt_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Secure; Max-Age=${maxAge}; Path=/`;
 }
 
 // 按 union_id（优先）或 open_id 找第一个匹配设备
