@@ -339,67 +339,26 @@ document.querySelector('#save-signature').addEventListener('click', async (event
   await loadSignatureConfig();
 });
 
-// 复制飞书签名 URL 事件
+// 复制签名链接
 document.querySelector('#copy-signature-url').addEventListener('click', async (event) => {
   const urlInput = document.querySelector('#signature-url');
-  await navigator.clipboard.writeText(urlInput.value);
+  const url = urlInput.value.trim();
+  if (!url.startsWith('http')) return;
   const btn = event.currentTarget;
-  btn.textContent = '已复制';
-  btn.classList.add('copied');
-  toast('已复制签名 URL');
-  setTimeout(() => {
-    btn.textContent = '复制 URL';
-    btn.classList.remove('copied');
-  }, 1500);
-});
-
-// 飞书签名编辑器需要带显示文本的富文本链接，裸 URL 只会显示域名。
-document.querySelector('#copy-signature-rich').addEventListener('click', async (event) => {
-  const label = document.querySelector('#signature-copy').textContent.trim();
-  const url = document.querySelector('#signature-url').value.trim();
-  if (!url.startsWith('http')) return alert('请先完成设备配对，生成专属签名 URL。');
-
-  const safeUrl = url.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-  const safeLabel = label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const html = `<a href="${safeUrl}">${safeLabel}</a>`;
   try {
-    if (window.ClipboardItem && navigator.clipboard.write) {
-      await navigator.clipboard.write([new ClipboardItem({
-        'text/html': new Blob([html], { type: 'text/html' }),
-        'text/plain': new Blob([label], { type: 'text/plain' })
-      })]);
-    } else {
-      const holder = document.createElement('div');
-      holder.contentEditable = 'true';
-      holder.innerHTML = html;
-      holder.style.position = 'fixed';
-      holder.style.left = '-9999px';
-      document.body.appendChild(holder);
-      const range = document.createRange();
-      range.selectNodeContents(holder);
-      const selection = window.getSelection();
-      selection.removeAllRanges();
-      selection.addRange(range);
-      document.execCommand('copy');
-      holder.remove();
-      selection.removeAllRanges();
-    }
-    const button = event.currentTarget;
-    button.textContent = '已复制，去飞书粘贴';
-    toast('已复制飞书签名，去个性签名框粘贴');
-    setTimeout(() => { button.textContent = '复制飞书签名'; }, 2200);
+    await navigator.clipboard.writeText(url);
   } catch {
-    // 降级：复制纯文本（飞书签名框支持直接粘贴文字）
-    try {
-      await navigator.clipboard.writeText(label);
-      const button = event.currentTarget;
-      button.textContent = '已复制（纯文本）';
-      toast('已复制签名文本，粘贴到飞书个性签名框即可');
-      setTimeout(() => { button.textContent = '复制飞书签名'; }, 2200);
-    } catch {
-      alert('复制失败，请手动选中下方签名文字后复制。');
-    }
+    // execCommand 降级
+    urlInput.select();
+    document.execCommand('copy');
   }
+  btn.textContent = '已复制 ✓';
+  btn.classList.add('copied');
+  toast('链接已复制，粘贴到飞书「个人资料 → 个性签名」保存即可');
+  setTimeout(() => {
+    btn.textContent = '复制链接';
+    btn.classList.remove('copied');
+  }, 2000);
 });
 
 document.querySelector('#refresh-feishu-signature').addEventListener('click', async (event) => {
@@ -422,19 +381,22 @@ document.querySelector('#refresh-feishu-signature').addEventListener('click', as
   setTimeout(() => { button.disabled = false; button.textContent = '立即刷新飞书签名'; }, 2500);
 });
 
-// 复制飞书签名纯文本事件
+// 复制签名文字（纯文本）
 document.querySelector('#copy-signature-text').addEventListener('click', async (event) => {
-  const signatureText = document.querySelector('#signature-copy').textContent;
-  await navigator.clipboard.writeText(signatureText);
+  const signatureText = document.querySelector('#signature-copy').textContent.trim();
   const btn = event.currentTarget;
-  const oldText = btn.textContent;
-  btn.textContent = '已复制文本';
+  try {
+    await navigator.clipboard.writeText(signatureText);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = signatureText;
+    ta.style.position = 'fixed'; ta.style.left = '-9999px';
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  btn.textContent = '已复制 ✓';
   btn.classList.add('copied');
-  toast('已复制纯文本签名');
-  setTimeout(() => {
-    btn.textContent = oldText;
-    btn.classList.remove('copied');
-  }, 1500);
+  toast('已复制签名文字');
+  setTimeout(() => { btn.textContent = '复制签名文字'; btn.classList.remove('copied'); }, 1500);
 });
 
 // 个人改名事件绑定

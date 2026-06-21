@@ -129,26 +129,23 @@
             <button id="save-signature" class="button primary">保存显示偏好</button>
           </div>
 
-          <div class="signature-preview">
+          <div class=”signature-preview”>
             <span>签名预览</span>
-            <strong id="signature-copy">🐢 海龟 Lv.5｜今日 Token 待同步｜更新 —</strong>
-            
-            <button id="copy-signature-rich" class="button primary small" style="width: fit-content; margin-top: 4px;">复制飞书签名</button>
-            <button id="refresh-feishu-signature" class="button ghost small" style="width: fit-content; margin-top: 4px;">立即刷新飞书签名</button>
-            <button id="copy-signature-text" class="button ghost small" style="width: fit-content; margin-top: 4px;">复制纯文本</button>
-            
-            <div class="signature-url-wrap">
-              <span class="url-label">飞书签名 URL</span>
-              <div class="url-input-group">
-                <input type="text" id="signature-url" readonly value="" placeholder="加载中..." />
-                <button id="copy-signature-url" class="copy-btn">复制 URL</button>
+            <strong id=”signature-copy”>🐢 海龟 Lv.5｜今日 Token 待同步｜更新 —</strong>
+
+            <button id=”refresh-feishu-signature” class=”button ghost small” style=”width: fit-content; margin-top: 4px;”>立即刷新飞书签名</button>
+            <button id=”copy-signature-text” class=”button ghost small” style=”width: fit-content; margin-top: 4px;”>复制签名文字</button>
+
+            <div class=”signature-url-wrap”>
+              <span class=”url-label”>飞书签名链接</span>
+              <div class=”url-input-group”>
+                <input type=”text” id=”signature-url” readonly value=”” placeholder=”加载中...” />
+                <button id=”copy-signature-url” class=”copy-btn”>复制链接</button>
               </div>
-              <p class="warning-hint" style="color: var(--coral); font-size: 11px; margin-top: 6px; line-height: 1.4; opacity: 0.9;">
-                使用方式：点“复制飞书签名”，再到飞书个人签名框粘贴。不要直接复制下方裸 URL，否则飞书只会显示域名。
+              <p class=”hint” style=”font-size: 11px; margin-top: 6px; line-height: 1.4;”>
+                复制链接 → 粘贴到飞书「个人资料 → 个性签名」→ 保存即可。飞书会自动展示最新 Token 数据，通常有 5–10 分钟缓存。
               </p>
             </div>
-
-            <p>推送方式：本地采集器 → HTTPS 上传 → 稳定签名 URL；飞书读取 URL 预览，通常有 5–10 分钟缓存。</p>
           </div>
 
           <div class="schedule-status">
@@ -196,6 +193,6 @@
       <p style="color:var(--text-muted);font-size:12px;margin:0;opacity:.6;">仅同一飞书企业的成员可见同一榜单</p>
     </div>
 
-    <script type="module" src="/app.js?v=0.2.6"></script>
+    <script type="module" src="/app.js?v=0.2.7"></script>
   </body>
 </html>
