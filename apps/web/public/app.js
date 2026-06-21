@@ -422,30 +422,41 @@ document.querySelector('#refresh-board').addEventListener('click', async () => {
   toast('排行榜已刷新');
 });
 
-// 立即刷新数据：手动重新拉取榜单 + 签名配置，并把最新签名推送到飞书（不必等定时）
+// 立即刷新数据：spawn 采集器拉最新数据 → 更新排行榜 → 推送飞书签名
 document.querySelector('#refresh-now').addEventListener('click', async (event) => {
   const button = event.currentTarget;
   const activeMetric = document.querySelector('#metric-choice .choice.active')?.dataset.value || 'today';
   button.disabled = true;
-  button.textContent = '正在刷新…';
+  button.textContent = '采集中…';
+  toast('正在采集最新数据，请稍候…');
   try {
-    await Promise.all([loadBoard(), loadSignatureConfig(), renderSignatureForMetric(activeMetric)]);
     const token = localStorage.getItem('device_token');
-    let pushed = 0;
+    let accepted = 0;
+    let feishuPushed = false;
     if (token) {
-      const response = await fetch('/api/v1/feishu/preview/refresh', { method: 'POST', headers: { authorization: `Bearer ${token}` } });
-      const result = await response.json().catch(() => ({}));
-      if (result.status === 'success') pushed = result.count || 0;
+      // 先触发服务端采集（会 spawn collector + 推送飞书）
+      const res = await fetch('/api/v1/collect', { method: 'POST', headers: { authorization: `Bearer ${token}` } });
+      const result = await res.json().catch(() => ({}));
+      accepted = result.accepted || 0;
+      feishuPushed = result.feishu_push === 'success';
     }
+    // 采集完后刷新页面数据
+    await Promise.all([loadBoard(), loadSignatureConfig(), renderSignatureForMetric(activeMetric)]);
     const stamp = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     document.querySelector('#refresh-stamp').textContent = `数据刷新于 ${stamp}`;
     button.textContent = '已刷新';
-    toast(pushed ? `已刷新数据并推送 ${pushed} 个飞书签名` : '页面数据已刷新');
+    if (feishuPushed) {
+      toast(`采集完成，新增 ${accepted} 条，飞书签名已推送`);
+    } else if (accepted > 0) {
+      toast(`采集完成，新增 ${accepted} 条，签名下次访问自动更新`);
+    } else {
+      toast('已是最新数据，飞书签名实时生效');
+    }
   } catch {
     button.textContent = '刷新失败，请重试';
-    toast('刷新失败，请重试');
+    toast('采集失败，请检查服务状态');
   }
-  setTimeout(() => { button.disabled = false; button.textContent = '立即刷新数据'; }, 2000);
+  setTimeout(() => { button.disabled = false; button.textContent = '立即刷新数据'; }, 3000);
 });
 
 loadBoard();

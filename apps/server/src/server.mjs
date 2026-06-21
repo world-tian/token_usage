@@ -184,10 +184,16 @@ async function getFeishuClient() {
   return feishuClientPromise;
 }
 
+const _previewCooldown = new Map(); // deviceId → last push timestamp
 async function refreshFeishuPreview(deviceId, reason = 'usage_updated') {
   const config = getDeviceConfig(deviceId || 'default');
   const previewTokens = [...new Set(config.preview_tokens || [])];
   if (!previewTokens.length) return { status: 'waiting_for_preview_token', count: 0 };
+  // 飞书 batchUpdate 有频率限制，2 分钟内同一设备只推一次
+  const now = Date.now();
+  const last = _previewCooldown.get(deviceId) || 0;
+  if (now - last < 2 * 60_000) return { status: 'rate_limited_local', count: previewTokens.length };
+  _previewCooldown.set(deviceId, now);
   if (!feishuAppId || !feishuAppSecret) {
     config.preview_refresh_status = 'waiting_for_app_credentials';
     config.preview_refresh_error = 'FEISHU_APP_ID / FEISHU_APP_SECRET not configured';
@@ -701,6 +707,33 @@ async function api(request, response, url) {
     }
 
     return json(response, 400, { error: 'unsupported feishu event type' });
+  }
+
+  // 立即触发采集：spawn 本地 collector，采集完后主动刷新飞书签名
+  if (request.method === 'POST' && url.pathname === '/api/v1/collect') {
+    const device = getDeviceByRequest(request);
+    if (!device) return json(response, 401, { error: 'invalid or missing device token' });
+    const { spawn } = await import('node:child_process');
+    return new Promise((resolve) => {
+      let output = '';
+      const proc = spawn(process.execPath, [collectorSource, 'sync', '--server', `http://127.0.0.1:${port}`], {
+        env: { ...process.env },
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      proc.stdout.on('data', (d) => { output += d.toString(); });
+      proc.stderr.on('data', (d) => { output += d.toString(); });
+      proc.on('error', (err) => resolve(json(response, 500, { ok: false, output: err.message })));
+      const timer = setTimeout(() => { proc.kill(); resolve(json(response, 504, { ok: false, output: 'collector timeout after 60s' })); }, 60_000);
+      proc.on('close', async (code) => {
+        clearTimeout(timer);
+        const match = output.match(/Accepted (\d+) events/);
+        const accepted = match ? Number(match[1]) : 0;
+        // 采集完成后主动推送飞书签名
+        const pushResult = await refreshFeishuPreview(device.id, 'manual_collect').catch(() => ({ status: 'skipped' }));
+        console.log(`[Collect] done code=${code} accepted=${accepted} feishu=${pushResult.status}`);
+        resolve(json(response, code === 0 ? 200 : 500, { ok: code === 0, accepted, output: output.trim(), feishu_push: pushResult.status }));
+      });
+    });
   }
 
   return false;
