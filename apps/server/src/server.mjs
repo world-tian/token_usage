@@ -638,6 +638,19 @@ async function api(request, response, url) {
     return json(response, 200, { feishu_open_id: session.feishu_open_id, union_id: session.union_id, tenant_key: session.tenant_key, profile: session.profile });
   }
 
+  if (request.method === 'GET' && url.pathname === '/api/v1/my-device-token') {
+    const session = getSessionFromRequest(request);
+    if (!session) return json(response, 401, { error: 'not_logged_in' });
+    const deviceId = findDeviceByFeishuId(session.union_id, true) || findDeviceByFeishuId(session.feishu_open_id, false);
+    if (!deviceId) return json(response, 404, { error: 'no_device_linked' });
+    let deviceToken = null;
+    for (const [tok, dev] of state.devices) {
+      if (dev.id === deviceId) { deviceToken = tok; break; }
+    }
+    if (!deviceToken) return json(response, 404, { error: 'device_token_not_in_state' });
+    return json(response, 200, { device_token: deviceToken, device_id: deviceId });
+  }
+
   if (request.method === 'POST' && url.pathname === '/api/v1/auth/logout') {
     const cookie = request.headers.cookie || '';
     const match = cookie.match(/(?:^|;\s*)tt_session=([^;]+)/);

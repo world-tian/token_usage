@@ -20,6 +20,17 @@ async function checkAuth() {
         if (token) await fetch('/api/v1/devices/feishu-link', { method: 'POST', headers: { authorization: `Bearer ${token}` } }).catch(() => {});
         history.replaceState({}, '', '/');
       }
+      // localStorage 里没有 device_token 时（换浏览器/清缓存），用飞书 session 自动恢复
+      if (!localStorage.getItem('device_token')) {
+        try {
+          const r = await fetch('/api/v1/my-device-token');
+          if (r.ok) {
+            const { device_token, device_id } = await r.json();
+            localStorage.setItem('device_token', device_token);
+            localStorage.setItem('device_id', device_id);
+          }
+        } catch {}
+      }
       await Promise.all([loadBoard(), loadSignatureConfig()]);
     } else {
       currentUser = null;
@@ -378,7 +389,16 @@ document.querySelector('#copy-signature-rich').addEventListener('click', async (
     toast('已复制飞书签名，去个性签名框粘贴');
     setTimeout(() => { button.textContent = '复制飞书签名'; }, 2200);
   } catch {
-    alert('富文本复制失败，请使用 Chrome/Edge/Safari 并允许剪贴板权限。');
+    // 降级：复制纯文本（飞书签名框支持直接粘贴文字）
+    try {
+      await navigator.clipboard.writeText(label);
+      const button = event.currentTarget;
+      button.textContent = '已复制（纯文本）';
+      toast('已复制签名文本，粘贴到飞书个性签名框即可');
+      setTimeout(() => { button.textContent = '复制飞书签名'; }, 2200);
+    } catch {
+      alert('复制失败，请手动选中下方签名文字后复制。');
+    }
   }
 });
 
