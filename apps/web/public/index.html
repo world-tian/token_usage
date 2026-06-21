@@ -12,9 +12,10 @@
     <header class="nav">
       <a class="brand" href="/">Token 潮汐 <span>Token Tide</span></a>
       <div class="user-status-area">
-        <span id="user-display-name">👤 本机用户</span>
-        <button id="edit-profile-btn" class="button ghost small">修改名称</button>
-        <button id="feishu-login-btn" class="button primary small">飞书登录</button>
+        <span id="user-display-name">👤 加载中...</span>
+        <button id="edit-profile-btn" class="button ghost small" style="display:none">修改名称</button>
+        <button id="feishu-login-btn" class="button primary small" style="display:none">飞书登录</button>
+        <button id="logout-btn" class="button ghost small" style="display:none">退出</button>
         <div class="health"><i></i> 本地开发版</div>
       </div>
     </header>
@@ -185,6 +186,16 @@
 
     <footer>Token 潮汐 v0.1.0 · 本地纵向闭环原型</footer>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="/app.js?v=0.2.2"></script>
+
+    <!-- 登录遮罩：未登录时全屏显示 -->
+    <div id="login-overlay" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(4,20,28,0.97);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:24px;">
+      <div style="font-size:48px">🌊</div>
+      <h2 style="color:var(--cyan);margin:0;font-size:28px;font-weight:700;">Token 潮汐</h2>
+      <p style="color:var(--text-muted);margin:0;text-align:center;max-width:320px;line-height:1.6;">用飞书账号登录，查看你所在公司的 AI 用量排行榜</p>
+      <a id="login-feishu-btn" href="/api/v1/auth/feishu/login" class="button primary" style="font-size:16px;padding:14px 36px;border-radius:12px;">飞书扫码 / 账号登录</a>
+      <p style="color:var(--text-muted);font-size:12px;margin:0;opacity:.6;">仅同一飞书企业的成员可见同一榜单</p>
+    </div>
+
+    <script type="module" src="/app.js?v=0.2.3"></script>
   </body>
 </html>

@@ -44,6 +44,15 @@ db.exec(`
     occurred_at TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id);
+  CREATE TABLE IF NOT EXISTS sessions (
+    session_token TEXT PRIMARY KEY,
+    feishu_open_id TEXT NOT NULL,
+    tenant_key TEXT NOT NULL,
+    profile_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_sessions_open_id ON sessions(feishu_open_id);
 `);
 
 let dbConfig = { devices: {} };
@@ -159,6 +168,48 @@ function saveDeviceConfig(deviceId, configUpdate, profileUpdate) {
   current.updated_at = new Date().toISOString();
   dbConfig.devices[id] = current;
   saveConfig();
+}
+
+// ── Session 管理（30 天 Cookie，存 SQLite）──────────────────────────────────
+function createSession(feishu_open_id, tenant_key, profile) {
+  const token = randomUUID() + randomUUID();
+  const now = new Date().toISOString();
+  const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  db.prepare('INSERT INTO sessions (session_token,feishu_open_id,tenant_key,profile_json,created_at,expires_at) VALUES (?,?,?,?,?,?)')
+    .run(token, feishu_open_id, tenant_key || '', JSON.stringify(profile), now, expires);
+  return token;
+}
+
+function getSession(token) {
+  if (!token) return null;
+  try {
+    const row = db.prepare('SELECT * FROM sessions WHERE session_token=? AND expires_at>?').get(token, new Date().toISOString());
+    if (!row) return null;
+    return { feishu_open_id: row.feishu_open_id, tenant_key: row.tenant_key, profile: JSON.parse(row.profile_json) };
+  } catch { return null; }
+}
+
+function deleteSession(token) {
+  if (token) db.prepare('DELETE FROM sessions WHERE session_token=?').run(token);
+}
+
+function getSessionFromRequest(request) {
+  const cookie = request.headers.cookie || '';
+  const match = cookie.match(/(?:^|;\s*)tt_session=([^;]+)/);
+  return match ? getSession(decodeURIComponent(match[1])) : null;
+}
+
+function sessionCookie(token, maxAge = 2592000) {
+  return `tt_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Max-Age=${maxAge}; Path=/`;
+}
+
+// 从 dbConfig 按 feishu_open_id 找第一个匹配设备
+function findDeviceByFeishuId(feishuOpenId) {
+  if (!feishuOpenId) return null;
+  for (const [did, cfg] of Object.entries(dbConfig.devices)) {
+    if (cfg.feishu_identity?.open_id === feishuOpenId) return did;
+  }
+  return null;
 }
 
 function addPreviewToken(deviceId, previewToken) {
@@ -336,13 +387,37 @@ function pairingSummary(pairing) {
   };
 }
 
-// seedDeviceIds：历史上传过的所有设备，保证它们即使本期间 0 消耗也以 0 出现在榜上（过 0 点后今日榜不再空白）
-function leaderboard(items = state.events, seedDeviceIds = [...new Set(state.events.map((e) => e.deviceId))]) {
-  const byDevice = new Map();
-  const newRow = (deviceId) => ({ device_id: deviceId, display_name: getDeviceConfig(deviceId).profile?.display_name || '本机用户', total_tokens: 0, tide_points: 0, tools: new Set(), models: new Map(), cost_usd: 0, cost_cny: 0, priced_tokens: 0, last_sync_at: null });
-  for (const deviceId of seedDeviceIds) byDevice.set(deviceId, newRow(deviceId));
+// leaderboard：按 feishu_open_id 合并多设备，可按 tenantKey 过滤
+// seedDeviceIds：历史上传过的所有设备，保证过 0 点今日榜不空
+function leaderboard(items = state.events, seedDeviceIds = [...new Set(state.events.map((e) => e.deviceId))], tenantKey = null) {
+  // 为每个 device_id 计算「规范 key」= feishu_open_id（如有）或 device_id
+  const canonicalOf = (deviceId) => getDeviceConfig(deviceId).feishu_identity?.open_id || deviceId;
+  const isAllowed = (deviceId) => {
+    if (!tenantKey) return true;
+    const cfg = getDeviceConfig(deviceId);
+    const openId = cfg.feishu_identity?.open_id;
+    if (!openId) return false; // 未绑定飞书的设备在租户视图里不可见
+    const devTenant = cfg.feishu_identity?.tenant_key;
+    return !devTenant || devTenant === tenantKey;
+  };
+
+  const byKey = new Map();
+  const newRow = (key, deviceId) => {
+    const cfg = getDeviceConfig(deviceId);
+    return { canonical_key: key, device_id: deviceId, feishu_open_id: cfg.feishu_identity?.open_id || null, display_name: cfg.profile?.display_name || '本机用户', avatar: cfg.profile?.avatar || '👤', total_tokens: 0, tide_points: 0, tools: new Set(), models: new Map(), cost_usd: 0, cost_cny: 0, priced_tokens: 0, last_sync_at: null };
+  };
+  const getOrCreate = (deviceId) => {
+    const key = canonicalOf(deviceId);
+    if (!byKey.has(key)) byKey.set(key, newRow(key, deviceId));
+    return byKey.get(key);
+  };
+
+  for (const deviceId of seedDeviceIds) {
+    if (isAllowed(deviceId)) getOrCreate(deviceId);
+  }
   for (const item of items) {
-    const row = byDevice.get(item.deviceId) || newRow(item.deviceId);
+    if (!isAllowed(item.deviceId)) continue;
+    const row = getOrCreate(item.deviceId);
     row.total_tokens += totalTokens(item.event);
     row.tide_points += tidePoints(item.event);
     row.tools.add(item.event.tool);
@@ -358,16 +433,13 @@ function leaderboard(items = state.events, seedDeviceIds = [...new Set(state.eve
     row.cost_cny += estimate.cny;
     if (estimate.priced) row.priced_tokens += totalTokens(item.event);
     if (!row.last_sync_at || item.event.occurred_at > row.last_sync_at) row.last_sync_at = item.event.occurred_at;
-    byDevice.set(item.deviceId, row);
   }
-  return [...byDevice.values()].map((row) => ({
+  return [...byKey.values()].map((row) => ({
     ...row,
     tools: [...row.tools],
     models: [...row.models.values()].sort((a, b) => b.tokens - a.tokens).map((item) => ({ ...item, ratio: row.total_tokens ? item.tokens / row.total_tokens : 0 })),
     pricing_coverage: row.total_tokens ? row.priced_tokens / row.total_tokens : 0,
-    currency: 'CNY',
-    usd_cny_rate: usdCnyRate,
-    cost_type: 'api_equivalent',
+    currency: 'CNY', usd_cny_rate: usdCnyRate, cost_type: 'api_equivalent',
     animal: animalLevel(row.tide_points)
   })).sort((a, b) => b.total_tokens - a.total_tokens).map((row, index) => ({ rank: index + 1, ...row }));
 }
@@ -386,17 +458,24 @@ function buildSignatureText(row, metric) {
   return `${row.animal.emoji} ${row.animal.name} Lv.${row.animal.level}｜${usage}｜≈${cost}${timePart}`;
 }
 
-function signatureConfigResponseForDevice(deviceId) {
+function signatureConfigResponseForDevice(deviceId, session = null) {
   const devConfig = getDeviceConfig(deviceId);
   const today = dateKey(new Date());
-  const deviceEvents = state.events.filter(item => item.deviceId === deviceId);
+  // 用 feishu_open_id 找到所有属于该用户的设备事件（多设备合并）
+  const feishuId = session?.feishu_open_id || devConfig.feishu_identity?.open_id;
+  const deviceEvents = feishuId
+    ? state.events.filter(item => (getDeviceConfig(item.deviceId).feishu_identity?.open_id || item.deviceId) === feishuId)
+    : state.events.filter(item => item.deviceId === deviceId);
   const items = devConfig.metric === 'today' ? deviceEvents.filter((item) => dateKey(item.event.occurred_at) === today) : deviceEvents;
-  const preview = leaderboard(items).find(row => row.device_id === deviceId) || null;
+  const canonicalKey = feishuId || deviceId;
+  const preview = leaderboard(items).find(row => row.canonical_key === canonicalKey || row.device_id === deviceId) || null;
   const latestReceipt = [...state.receipts.values()].at(-1);
   const nextAt = devConfig.auto_collect_enabled ? new Date(Date.now() + devConfig.interval_minutes * 60_000).toISOString() : null;
+  // 签名 URL：优先用 feishu_id（稳定，换设备不变），否则用 device_id
   const signatureUrl = new URL('/signature', baseUrl);
-  signatureUrl.searchParams.set('device_id', deviceId);
-  return { ...devConfig, preview, signature_url: signatureUrl.toString(), public_base_url: baseUrl, timezone: organizationTimeZone, last_collect_at: latestReceipt?.received_at || null, next_collect_at: nextAt, scheduler_status: devConfig.auto_collect_enabled ? 'configured' : 'not_enabled', cache_delay_minutes: '5-10' };
+  if (feishuId) signatureUrl.searchParams.set('feishu_id', feishuId);
+  else signatureUrl.searchParams.set('device_id', deviceId);
+  return { ...devConfig, preview, signature_url: signatureUrl.toString(), feishu_open_id: feishuId || null, public_base_url: baseUrl, timezone: organizationTimeZone, last_collect_at: latestReceipt?.received_at || null, next_collect_at: nextAt, scheduler_status: devConfig.auto_collect_enabled ? 'configured' : 'not_enabled', cache_delay_minutes: '5-10' };
 }
 
 function getDeviceByRequest(request) {
@@ -407,20 +486,29 @@ function getDeviceByRequest(request) {
 
 function generateLinkPreviewResponse(targetUrlStr, previewToken) {
   let deviceId = null;
+  let feishuId = null;
   try {
     const targetUrl = new URL(targetUrlStr);
     deviceId = targetUrl.searchParams.get('device_id');
+    feishuId = targetUrl.searchParams.get('feishu_id');
   } catch (e) {
     console.error('[Link Preview] Failed to parse target URL:', targetUrlStr, e);
   }
-  
+  // feishu_id → 找对应设备
+  if (feishuId && !deviceId) deviceId = findDeviceByFeishuId(feishuId);
+
   const config = deviceId ? getDeviceConfig(deviceId) : state.signatureConfig;
   const today = dateKey(new Date());
-  const sourceEvents = deviceId ? state.events.filter(item => item.deviceId === deviceId) : state.events;
+  const canonicalKey = feishuId || deviceId;
+  const sourceEvents = canonicalKey
+    ? state.events.filter(item => feishuId
+        ? (getDeviceConfig(item.deviceId).feishu_identity?.open_id || item.deviceId) === feishuId
+        : item.deviceId === deviceId)
+    : state.events;
   const items = config.metric === 'today' ? sourceEvents.filter((item) => dateKey(item.event.occurred_at) === today) : sourceEvents;
-  
-  const row = deviceId 
-    ? (leaderboard(items).find(r => r.device_id === deviceId) || null)
+
+  const row = canonicalKey
+    ? (leaderboard(items).find(r => r.canonical_key === canonicalKey || r.device_id === deviceId) || null)
     : (leaderboard(items)[0] || null);
     
   const text = buildSignatureText(row, config.metric);
@@ -523,11 +611,47 @@ async function api(request, response, url) {
     return receipt ? json(response, 200, receipt) : json(response, 404, { error: 'receipt not found' });
   }
 
+  if (request.method === 'GET' && url.pathname === '/api/v1/me') {
+    const session = getSessionFromRequest(request);
+    if (!session) return json(response, 401, { error: 'not_logged_in' });
+    return json(response, 200, { feishu_open_id: session.feishu_open_id, tenant_key: session.tenant_key, profile: session.profile });
+  }
+
+  if (request.method === 'POST' && url.pathname === '/api/v1/auth/logout') {
+    const cookie = request.headers.cookie || '';
+    const match = cookie.match(/(?:^|;\s*)tt_session=([^;]+)/);
+    if (match) deleteSession(decodeURIComponent(match[1]));
+    response.writeHead(200, { 'content-type': 'application/json', 'set-cookie': sessionCookie('', 0) });
+    response.end(JSON.stringify({ ok: true }));
+    return true;
+  }
+
+  // 已登录用户把当前设备和飞书账号关联（前端在 feishu_login=success 后自动调）
+  if (request.method === 'POST' && url.pathname === '/api/v1/devices/feishu-link') {
+    const session = getSessionFromRequest(request);
+    if (!session) return json(response, 401, { error: 'not_logged_in' });
+    const device = getDeviceByRequest(request);
+    if (device) {
+      const cfg = getDeviceConfig(device.id);
+      if (!cfg.feishu_identity?.open_id) {
+        cfg.feishu_identity = { mode: 'session_link', open_id: session.feishu_open_id, tenant_key: session.tenant_key };
+        cfg.profile = session.profile;
+        cfg.feishu_status = 'connected';
+        saveConfig();
+      }
+    }
+    return json(response, 200, { linked: !!device, feishu_open_id: session.feishu_open_id });
+  }
+
   if (request.method === 'GET' && url.pathname === '/api/v1/leaderboard') {
+    const session = getSessionFromRequest(request);
+    // 配置了飞书时必须登录；未配置飞书时（本地开发）允许不登录
+    if (!session && feishuAppId) return json(response, 401, { error: 'login_required' });
+    const tenantKey = session?.tenant_key || null;
     const period = url.searchParams.get('period') || 'total';
     const today = dateKey(new Date());
     const items = period === 'today' ? state.events.filter((item) => dateKey(item.event.occurred_at) === today) : state.events;
-    return json(response, 200, { data: leaderboard(items), generated_at: new Date().toISOString() });
+    return json(response, 200, { data: leaderboard(items, undefined, tenantKey), generated_at: new Date().toISOString() });
   }
 
   if (request.method === 'GET' && url.pathname === '/api/v1/feishu/diagnostics') {
@@ -549,11 +673,13 @@ async function api(request, response, url) {
   }
 
   if (request.method === 'GET' && url.pathname === '/api/v1/signature/config') {
+    const session = getSessionFromRequest(request);
     const device = getDeviceByRequest(request);
-    if (device) {
-      return json(response, 200, signatureConfigResponseForDevice(device.id));
-    }
-    return json(response, 200, signatureConfigResponseForDevice('default'));
+    // 找到与当前用户关联的设备（session 登录用户 > 设备 token > 默认）
+    let effectiveDeviceId = device?.id;
+    if (!effectiveDeviceId && session?.feishu_open_id) effectiveDeviceId = findDeviceByFeishuId(session.feishu_open_id);
+    if (!effectiveDeviceId && !session && feishuAppId) return json(response, 401, { error: 'not_authenticated' });
+    return json(response, 200, signatureConfigResponseForDevice(effectiveDeviceId || 'default', session));
   }
 
   if (request.method === 'PUT' && url.pathname === '/api/v1/signature/config') {
@@ -637,7 +763,9 @@ async function api(request, response, url) {
       config.feishu_identity = identity;
       config.updated_at = new Date().toISOString();
       saveConfig();
-      response.writeHead(302, { location: '/?feishu_login=success' });
+      // 创建 30 天 Session Cookie
+      const sessionToken = createSession(identity.open_id || randomUUID(), identity.tenant_key || '', profile);
+      response.writeHead(302, { location: '/?feishu_login=success', 'set-cookie': sessionCookie(sessionToken) });
     } catch (error) {
       console.error('[Feishu OAuth] Login failed:', error.message);
       response.writeHead(302, { location: `/?feishu_error=${encodeURIComponent(error.message)}` });
@@ -755,15 +883,21 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url, baseUrl);
     if (request.method === 'GET' && url.pathname === '/signature') {
       console.log(`[Signature Request] URL requested at ${new Date().toISOString()} | User-Agent: ${request.headers['user-agent'] || 'unknown'}`);
-      const deviceId = url.searchParams.get('device_id');
-      remember(state.signatureRequests, { at: new Date().toISOString(), device_id: deviceId, user_agent: request.headers['user-agent'] || 'unknown', cf_ray: request.headers['cf-ray'] || null });
+      let deviceId = url.searchParams.get('device_id');
+      const feishuId = url.searchParams.get('feishu_id');
+      if (feishuId && !deviceId) deviceId = findDeviceByFeishuId(feishuId);
+      remember(state.signatureRequests, { at: new Date().toISOString(), device_id: deviceId, feishu_id: feishuId, user_agent: request.headers['user-agent'] || 'unknown', cf_ray: request.headers['cf-ray'] || null });
       const config = deviceId ? getDeviceConfig(deviceId) : state.signatureConfig;
       const today = dateKey(new Date());
-      const sourceEvents = deviceId ? state.events.filter(item => item.deviceId === deviceId) : state.events;
+      const canonicalKey = feishuId || deviceId;
+      const sourceEvents = canonicalKey
+        ? state.events.filter(item => feishuId
+            ? (getDeviceConfig(item.deviceId).feishu_identity?.open_id || item.deviceId) === feishuId
+            : item.deviceId === deviceId)
+        : state.events;
       const items = config.metric === 'today' ? sourceEvents.filter((item) => dateKey(item.event.occurred_at) === today) : sourceEvents;
-      
-      const row = deviceId 
-        ? (leaderboard(items).find(r => r.device_id === deviceId) || null)
+      const row = canonicalKey
+        ? (leaderboard(items).find(r => r.canonical_key === canonicalKey || r.device_id === deviceId) || null)
         : (leaderboard(items)[0] || null);
         
       const text = buildSignatureText(row, config.metric);
@@ -810,10 +944,16 @@ const server = createServer(async (request, response) => {
       return;
     }
     if (request.method === 'GET' && url.pathname === '/signature-card.svg') {
-      const deviceId = url.searchParams.get('device_id');
-      const config = deviceId ? getDeviceConfig(deviceId) : state.signatureConfig;
-      const sourceEvents = deviceId ? state.events.filter(item => item.deviceId === deviceId) : state.events;
-      const row = (deviceId ? leaderboard(sourceEvents).find(item => item.device_id === deviceId) : leaderboard(sourceEvents)[0]) || null;
+      const svgDeviceId = url.searchParams.get('device_id');
+      const svgFeishuId = url.searchParams.get('feishu_id');
+      const resolvedDeviceId = svgDeviceId || (svgFeishuId ? findDeviceByFeishuId(svgFeishuId) : null);
+      const svgKey = svgFeishuId || resolvedDeviceId;
+      const sourceEvents = svgKey
+        ? state.events.filter(item => svgFeishuId
+            ? (getDeviceConfig(item.deviceId).feishu_identity?.open_id || item.deviceId) === svgFeishuId
+            : item.deviceId === resolvedDeviceId)
+        : state.events;
+      const row = svgKey ? (leaderboard(sourceEvents).find(r => r.canonical_key === svgKey || r.device_id === resolvedDeviceId) || null) : (leaderboard(sourceEvents)[0] || null);
       const title = row ? `${row.animal.emoji} ${row.animal.name} Lv.${row.animal.level}` : '🌊 Token 潮汐';
       const subtitle = row ? `${new Intl.NumberFormat('zh-CN', { notation: 'compact' }).format(row.total_tokens)} Token · ≈¥${row.cost_cny.toFixed(2)}` : '等待首次采集';
       response.writeHead(200, { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'no-cache, no-store, must-revalidate' });

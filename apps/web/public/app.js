@@ -1,3 +1,60 @@
+let currentUser = null; // { feishu_open_id, tenant_key, profile } — 从 /api/v1/me 获取
+
+// ── 登录墙 ──────────────────────────────────────────────────────────────────
+function showLoginOverlay(visible) {
+  const overlay = document.querySelector('#login-overlay');
+  if (!overlay) return;
+  overlay.style.display = visible ? 'flex' : 'none';
+}
+
+async function checkAuth() {
+  try {
+    const res = await fetch('/api/v1/me');
+    if (res.ok) {
+      currentUser = await res.json();
+      showLoginOverlay(false);
+      renderCurrentUser();
+      // 如果是刚 OAuth 完成，把当前设备和飞书账号绑定
+      if (new URLSearchParams(location.search).get('feishu_login') === 'success') {
+        const token = localStorage.getItem('device_token');
+        if (token) await fetch('/api/v1/devices/feishu-link', { method: 'POST', headers: { authorization: `Bearer ${token}` } }).catch(() => {});
+        history.replaceState({}, '', '/');
+      }
+      await Promise.all([loadBoard(), loadSignatureConfig()]);
+    } else {
+      currentUser = null;
+      showLoginOverlay(true);
+    }
+  } catch {
+    currentUser = null;
+    showLoginOverlay(true);
+  }
+}
+
+function renderCurrentUser() {
+  if (!currentUser) return;
+  const profile = currentUser.profile || {};
+  const nameEl = document.querySelector('#user-display-name');
+  const avatar = profile.avatar || '👤';
+  if (typeof avatar === 'string' && avatar.startsWith('http')) {
+    nameEl.innerHTML = `<img src="${escapeHtml(avatar)}" alt="" style="width:20px;height:20px;border-radius:50%;vertical-align:middle;margin-right:6px;object-fit:cover;">${escapeHtml(profile.display_name || '飞书用户')}`;
+  } else {
+    nameEl.textContent = `${avatar} ${profile.display_name || '飞书用户'}`;
+  }
+  document.querySelector('#logout-btn').style.display = 'inline-block';
+  document.querySelector('#feishu-login-btn').style.display = 'none';
+}
+
+document.querySelector('#logout-btn')?.addEventListener('click', async () => {
+  await fetch('/api/v1/auth/logout', { method: 'POST' });
+  currentUser = null;
+  localStorage.removeItem('device_token');
+  localStorage.removeItem('device_id');
+  showLoginOverlay(true);
+  document.querySelector('#user-display-name').textContent = '👤 未登录';
+  document.querySelector('#logout-btn').style.display = 'none';
+});
+
 const createButton = document.querySelector('#create-code');
 const pairing = document.querySelector('#pairing');
 const receipt = document.querySelector('#receipt');
@@ -98,6 +155,7 @@ let currentPeriod = 'total';
 
 async function loadBoard() {
   const response = await fetch(`/api/v1/leaderboard?period=${currentPeriod}`);
+  if (response.status === 401) { showLoginOverlay(true); return; }
   const { data } = await response.json();
   document.querySelector('#board-empty').classList.toggle('hidden', data.length > 0);
   document.querySelector('#board').innerHTML = data.map((row) => `
@@ -133,14 +191,19 @@ function updateSignaturePreview(row, metric) {
   el.textContent = `${row.animal.emoji} ${row.animal.name} Lv.${row.animal.level}｜${usage}｜≈${money(row.cost_cny)}${timePart}`;
 }
 
-// 按口径(today/total)拉取对应数据并渲染签名预览，便于切换/复制不同口径的签名
+// 按口径(today/total)拉取对应数据并渲染签名预览
 async function renderSignatureForMetric(metric) {
-  const deviceId = localStorage.getItem('device_id');
   const period = metric === 'today' ? 'today' : 'total';
   try {
     const res = await fetch(`/api/v1/leaderboard?period=${period}`);
+    if (res.status === 401) { updateSignaturePreview(null, metric); return; }
     const { data } = await res.json();
-    const row = (deviceId ? data.find((r) => r.device_id === deviceId) : data[0]) || null;
+    // 优先用 feishu_open_id 找本人行，其次用 device_id，都没有取第一
+    const feishuId = currentUser?.feishu_open_id;
+    const deviceId = localStorage.getItem('device_id');
+    const row = (feishuId ? data.find(r => r.feishu_open_id === feishuId) : null)
+      ?? (deviceId ? data.find(r => r.device_id === deviceId) : null)
+      ?? data[0] ?? null;
     updateSignaturePreview(row, metric);
   } catch {
     updateSignaturePreview(null, metric);
@@ -166,29 +229,14 @@ async function loadSignatureConfig() {
   // 更新定时采集 Checkbox 状态
   document.querySelector('#auto-collect').checked = !!config.auto_collect_enabled;
   
-  // 填入飞书签名 URL（专属链接）
-  if (deviceId) {
-    document.querySelector('#signature-url').value = config.signature_url || `${window.location.origin}/signature?device_id=${deviceId}`;
+  // 签名 URL：优先 feishu_id（稳定，换设备不变），其次 config 里的 URL
+  const feishuId = currentUser?.feishu_open_id || config.feishu_open_id;
+  if (feishuId) {
+    document.querySelector('#signature-url').value = `${window.location.origin}/signature?feishu_id=${feishuId}`;
+  } else if (config.signature_url) {
+    document.querySelector('#signature-url').value = config.signature_url;
   } else {
-    document.querySelector('#signature-url').value = '配对成功后在此生成专属 URL';
-  }
-  
-  // 更新顶部用户状态：飞书头像是图片 URL → 渲染成圆形头像；否则当 emoji 文本
-  const profile = config.profile || { display_name: '本机用户', avatar: '👤' };
-  const nameEl = document.querySelector('#user-display-name');
-  const avatar = profile.avatar || '👤';
-  nameEl.dataset.name = profile.display_name;
-  if (typeof avatar === 'string' && avatar.startsWith('http')) {
-    nameEl.innerHTML = `<img src="${escapeHtml(avatar)}" alt="" style="width:20px;height:20px;border-radius:50%;vertical-align:middle;margin-right:6px;object-fit:cover;">${escapeHtml(profile.display_name)}`;
-  } else {
-    nameEl.textContent = `${avatar} ${profile.display_name}`;
-  }
-  
-  const feishuBtn = document.querySelector('#feishu-login-btn');
-  if (config.feishu_status === 'connected') {
-    feishuBtn.style.display = 'none';
-  } else {
-    feishuBtn.style.display = 'inline-block';
+    document.querySelector('#signature-url').value = '登录飞书后自动生成专属 URL';
   }
   
   document.querySelectorAll('#metric-choice .choice').forEach((item) => item.classList.toggle('active', item.dataset.value === config.metric));
@@ -459,5 +507,4 @@ document.querySelector('#refresh-now').addEventListener('click', async (event) =
   setTimeout(() => { button.disabled = false; button.textContent = '立即刷新数据'; }, 3000);
 });
 
-loadBoard();
-loadSignatureConfig();
+checkAuth();
