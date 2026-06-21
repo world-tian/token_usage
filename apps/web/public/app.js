@@ -198,10 +198,12 @@ async function renderSignatureForMetric(metric) {
     const res = await fetch(`/api/v1/leaderboard?period=${period}`);
     if (res.status === 401) { updateSignaturePreview(null, metric); return; }
     const { data } = await res.json();
-    // 优先用 feishu_open_id 找本人行，其次用 device_id，都没有取第一
+    // 优先用 union_id（跨应用稳定）找本人行，其次 open_id，其次 device_id
+    const unionId = currentUser?.union_id;
     const feishuId = currentUser?.feishu_open_id;
     const deviceId = localStorage.getItem('device_id');
-    const row = (feishuId ? data.find(r => r.feishu_open_id === feishuId) : null)
+    const row = (unionId ? data.find(r => r.canonical_key === unionId || r.feishu_union_id === unionId) : null)
+      ?? (feishuId ? data.find(r => r.feishu_open_id === feishuId) : null)
       ?? (deviceId ? data.find(r => r.device_id === deviceId) : null)
       ?? data[0] ?? null;
     updateSignaturePreview(row, metric);
@@ -229,10 +231,10 @@ async function loadSignatureConfig() {
   // 更新定时采集 Checkbox 状态
   document.querySelector('#auto-collect').checked = !!config.auto_collect_enabled;
   
-  // 签名 URL：优先 feishu_id（稳定，换设备不变），其次 config 里的 URL
-  const feishuId = currentUser?.feishu_open_id || config.feishu_open_id;
-  if (feishuId) {
-    document.querySelector('#signature-url').value = `${window.location.origin}/signature?feishu_id=${feishuId}`;
+  // 签名 URL：优先 union_id（跨应用稳定），其次 config 里的 URL
+  const stableId = currentUser?.union_id || config.feishu_union_id || currentUser?.feishu_open_id || config.feishu_open_id;
+  if (stableId) {
+    document.querySelector('#signature-url').value = `${window.location.origin}/signature?feishu_id=${stableId}`;
   } else if (config.signature_url) {
     document.querySelector('#signature-url').value = config.signature_url;
   } else {
