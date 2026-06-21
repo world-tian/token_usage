@@ -519,9 +519,12 @@ function generateLinkPreviewResponse(targetUrlStr, previewToken) {
   const today = dateKey(new Date());
   const canonicalKey = feishuId || deviceId;
   const sourceEvents = canonicalKey
-    ? state.events.filter(item => feishuId
-        ? (getDeviceConfig(item.deviceId).feishu_identity?.open_id || item.deviceId) === feishuId
-        : item.deviceId === deviceId)
+    ? state.events.filter(item => {
+        const fi = getDeviceConfig(item.deviceId).feishu_identity;
+        return feishuId
+          ? (fi?.union_id === feishuId || fi?.open_id === feishuId || item.deviceId === deviceId)
+          : item.deviceId === deviceId;
+      })
     : state.events;
   const items = config.metric === 'today' ? sourceEvents.filter((item) => dateKey(item.event.occurred_at) === today) : sourceEvents;
 
@@ -908,15 +911,18 @@ const server = createServer(async (request, response) => {
       const today = dateKey(new Date());
       const canonicalKey = feishuId || deviceId;
       const sourceEvents = canonicalKey
-        ? state.events.filter(item => feishuId
-            ? (getDeviceConfig(item.deviceId).feishu_identity?.open_id || item.deviceId) === feishuId
-            : item.deviceId === deviceId)
+        ? state.events.filter(item => {
+            const fi = getDeviceConfig(item.deviceId).feishu_identity;
+            return feishuId
+              ? (fi?.union_id === feishuId || fi?.open_id === feishuId || item.deviceId === deviceId)
+              : item.deviceId === deviceId;
+          })
         : state.events;
       const items = config.metric === 'today' ? sourceEvents.filter((item) => dateKey(item.event.occurred_at) === today) : sourceEvents;
       const row = canonicalKey
         ? (leaderboard(items).find(r => r.canonical_key === canonicalKey || r.device_id === deviceId) || null)
         : (leaderboard(items)[0] || null);
-        
+
       const text = buildSignatureText(row, config.metric);
 
       const requestPublicOrigin = publicOriginForRequest(request);
