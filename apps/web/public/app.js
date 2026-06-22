@@ -7,9 +7,20 @@ function showLoginOverlay(visible) {
   overlay.style.display = visible ? 'flex' : 'none';
 }
 
+function renderLoggedOut() {
+  const nameEl = document.querySelector('#user-display-name');
+  if (nameEl) nameEl.textContent = '👤 未登录';
+  const logoutBtn = document.querySelector('#logout-btn');
+  const loginBtn = document.querySelector('#feishu-login-btn');
+  if (logoutBtn) logoutBtn.style.display = 'none';
+  if (loginBtn) loginBtn.style.display = 'inline-block';
+}
+
 async function checkAuth() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
   try {
-    const res = await fetch('/api/v1/me');
+    const res = await fetch('/api/v1/me', { signal: controller.signal, credentials: 'same-origin' });
     if (res.ok) {
       currentUser = await res.json();
       showLoginOverlay(false);
@@ -34,11 +45,15 @@ async function checkAuth() {
       await Promise.all([loadBoard(), loadSignatureConfig()]);
     } else {
       currentUser = null;
+      renderLoggedOut();
       showLoginOverlay(true);
     }
   } catch {
     currentUser = null;
+    renderLoggedOut();
     showLoginOverlay(true);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -361,7 +376,7 @@ document.querySelector('#copy-signature-url').addEventListener('click', async (e
   }, 2000);
 });
 
-document.querySelector('#refresh-feishu-signature').addEventListener('click', async (event) => {
+document.querySelector('#refresh-feishu-signature')?.addEventListener('click', async (event) => {
   const token = localStorage.getItem('device_token');
   if (!token) return alert('请先完成设备配对。');
   const button = event.currentTarget;
@@ -382,7 +397,7 @@ document.querySelector('#refresh-feishu-signature').addEventListener('click', as
 });
 
 // 复制签名文字（纯文本）
-document.querySelector('#copy-signature-text').addEventListener('click', async (event) => {
+document.querySelector('#copy-signature-text')?.addEventListener('click', async (event) => {
   const signatureText = document.querySelector('#signature-copy').textContent.trim();
   const btn = event.currentTarget;
   try {

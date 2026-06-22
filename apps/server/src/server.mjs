@@ -1,6 +1,8 @@
 import { createReadStream, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { homedir } from 'node:os';
 import { extname, join, normalize } from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
@@ -466,12 +468,13 @@ function dateKey(value) {
 }
 
 // 统一构造签名文字：今日 → 「今日消耗token X」，累计 → 「累计token消耗 X」；不带"更新"二字
-function buildSignatureText(row, metric) {
+function buildSignatureText(row, metric, collectedAt = null) {
   if (!row) return metric === 'today' ? '今日暂无大模型用量 🌊 待自动采集' : '暂无大模型用量 🌊 待自动采集';
   const tokens = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 2 }).format(row.total_tokens || 0);
   const cost = new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY', maximumFractionDigits: 2 }).format(row.cost_cny || 0);
   const usage = metric === 'today' ? `今日消耗token ${tokens}` : `累计token消耗 ${tokens}`;
-  const timePart = row.last_sync_at ? `｜${new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(row.last_sync_at))}` : '';
+  const displayTime = collectedAt || row.last_sync_at;
+  const timePart = displayTime ? `｜${new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(displayTime))}` : '';
   return `${row.animal.emoji} ${row.animal.name} Lv.${row.animal.level}｜${usage}｜≈${cost}${timePart}`;
 }
 
@@ -486,15 +489,17 @@ function signatureConfigResponseForDevice(deviceId, session = null) {
   const items = devConfig.metric === 'today' ? deviceEvents.filter((item) => dateKey(item.event.occurred_at) === today) : deviceEvents;
   const canonicalKey = feishuId || deviceId;
   const preview = leaderboard(items).find(row => row.canonical_key === canonicalKey || row.device_id === deviceId) || null;
-  const latestReceipt = [...state.receipts.values()].at(-1);
-  const nextAt = devConfig.auto_collect_enabled ? new Date(Date.now() + devConfig.interval_minutes * 60_000).toISOString() : null;
+  const lastCollectAt = devConfig.last_collect_at || null;
+  const nextAt = devConfig.auto_collect_enabled
+    ? (devConfig.next_scheduled_collect_at || new Date(Date.now() + devConfig.interval_minutes * 60_000).toISOString())
+    : null;
   // 签名 URL：优先用 union_id（跨应用稳定），否则 open_id，最后 device_id
   const unionId = session?.union_id || devConfig.feishu_identity?.union_id;
   const signatureUrl = new URL('/signature', baseUrl);
   if (unionId) signatureUrl.searchParams.set('feishu_id', unionId);
   else if (feishuId) signatureUrl.searchParams.set('feishu_id', feishuId);
   else signatureUrl.searchParams.set('device_id', deviceId);
-  return { ...devConfig, preview, signature_url: signatureUrl.toString(), feishu_open_id: feishuId || null, feishu_union_id: unionId || null, public_base_url: baseUrl, timezone: organizationTimeZone, last_collect_at: latestReceipt?.received_at || null, next_collect_at: nextAt, scheduler_status: devConfig.auto_collect_enabled ? 'configured' : 'not_enabled', cache_delay_minutes: '5-10' };
+  return { ...devConfig, preview, signature_url: signatureUrl.toString(), feishu_open_id: feishuId || null, feishu_union_id: unionId || null, public_base_url: baseUrl, timezone: organizationTimeZone, last_collect_at: lastCollectAt, next_collect_at: nextAt, scheduler_status: devConfig.auto_collect_enabled ? (devConfig.scheduler_last_status || 'configured') : 'not_enabled', cache_delay_minutes: '5-10' };
 }
 
 function getDeviceByRequest(request) {
@@ -535,7 +540,7 @@ function generateLinkPreviewResponse(targetUrlStr, previewToken) {
     ? (leaderboard(items).find(r => r.canonical_key === canonicalKey || r.device_id === deviceId) || null)
     : (leaderboard(items)[0] || null);
     
-  const text = buildSignatureText(row, config.metric);
+  const text = buildSignatureText(row, config.metric, config.last_collect_at);
 
   // 飞书 url.preview.get 应答：inline 必填，title 为签名要显示的文字（i18n_title 优先级更高，这里用单语言 title 即可）
   // inline.url 指向主页：别人点我的签名预览，直接跳到主页去登录并配置他自己的签名
@@ -620,6 +625,11 @@ async function api(request, response, url) {
       persistEvent(device.id, event, key);
     });
     const receipt = buildReceipt(events, accepted, rejected, duplicateCount);
+    const deviceConfig = getDeviceConfig(device.id);
+    deviceConfig.last_collect_at = new Date().toISOString();
+    deviceConfig.last_collect_accepted = accepted.length;
+    deviceConfig.last_collect_duplicates = duplicateCount;
+    saveConfig();
     state.receipts.set(receipt.request_id, receipt);
     emitPairing(pairing, 'uploaded', { request_id: receipt.request_id, receipt });
     emitPairing(pairing, 'aggregated', { request_id: receipt.request_id });
@@ -877,7 +887,6 @@ async function api(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/v1/collect') {
     const device = getDeviceByRequest(request);
     if (!device) return json(response, 401, { error: 'invalid or missing device token' });
-    const { spawn } = await import('node:child_process');
     return new Promise((resolve) => {
       let output = '';
       const proc = spawn(process.execPath, [collectorSource, 'sync', '--server', `http://127.0.0.1:${port}`], {
@@ -939,7 +948,7 @@ const server = createServer(async (request, response) => {
         ? (leaderboard(items).find(r => r.canonical_key === canonicalKey || r.device_id === deviceId) || null)
         : (leaderboard(items)[0] || null);
 
-      const text = buildSignatureText(row, config.metric);
+      const text = buildSignatureText(row, config.metric, config.last_collect_at);
 
       const requestPublicOrigin = publicOriginForRequest(request);
       const canonicalUrl = new URL('/signature', requestPublicOrigin);
@@ -1130,8 +1139,85 @@ const server = createServer(async (request, response) => {
   }
 });
 
+// ── 真实后台定时采集 ───────────────────────────────────────────────────
+// 采集器的本地凭据决定上传到哪个设备，避免对历史设备重复采集。
+const localCollectorServer = `http://127.0.0.1:${port}`;
+const collectorCredentialsFile = join(homedir(), '.token-tide', 'credentials.json');
+let scheduledCollectionRunning = false;
+
+function localCollectorDeviceId() {
+  try {
+    const credentials = JSON.parse(readFileSync(collectorCredentialsFile, 'utf8'));
+    return credentials[localCollectorServer]?.device_id || credentials[baseUrl]?.device_id || null;
+  } catch {
+    return null;
+  }
+}
+
+function runScheduledCollector(deviceId) {
+  return new Promise((resolve) => {
+    let output = '';
+    const proc = spawn(process.execPath, [collectorSource, 'sync', '--server', localCollectorServer], {
+      env: { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    proc.stdout.on('data', (data) => { output += data.toString(); });
+    proc.stderr.on('data', (data) => { output += data.toString(); });
+    const timer = setTimeout(() => proc.kill(), 90_000);
+    proc.on('error', (error) => resolve({ ok: false, error: error.message, output }));
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ ok: code === 0, code, output: output.trim() });
+    });
+  });
+}
+
+async function scheduledCollectionTick() {
+  if (scheduledCollectionRunning) return;
+  const deviceId = localCollectorDeviceId();
+  if (!deviceId || !dbConfig.devices[deviceId]) return;
+  const config = getDeviceConfig(deviceId);
+  if (!config.auto_collect_enabled) return;
+  const intervalMs = Math.max(1, Number(config.interval_minutes) || 30) * 60_000;
+  const lastRun = config.last_scheduled_collect_at ? Date.parse(config.last_scheduled_collect_at) : 0;
+  const dueAt = lastRun ? lastRun + intervalMs : Date.now();
+  config.next_scheduled_collect_at = new Date(Math.max(Date.now(), dueAt)).toISOString();
+  saveConfig();
+  if (Date.now() < dueAt) return;
+
+  scheduledCollectionRunning = true;
+  config.scheduler_last_status = 'running';
+  config.scheduler_last_error = null;
+  saveConfig();
+  console.log(`[Scheduler] Starting collector for device ${deviceId}`);
+  try {
+    const result = await runScheduledCollector(deviceId);
+    const finishedAt = new Date().toISOString();
+    config.last_scheduled_collect_at = finishedAt;
+    config.last_collect_at = config.last_collect_at || finishedAt;
+    config.next_scheduled_collect_at = new Date(Date.now() + intervalMs).toISOString();
+    config.scheduler_last_status = result.ok ? 'success' : 'failed';
+    config.scheduler_last_error = result.ok ? null : (result.error || result.output.slice(-500) || `exit ${result.code}`);
+    saveConfig();
+    // batch 接口已会推送；这里再补一次，本地 2 分钟防抖会自动去重。
+    const push = await refreshFeishuPreview(deviceId, 'scheduled_collect');
+    console.log(`[Scheduler] Collector ${result.ok ? 'completed' : 'failed'}; Feishu ${push.status}; next ${config.next_scheduled_collect_at}`);
+  } catch (error) {
+    config.last_scheduled_collect_at = new Date().toISOString();
+    config.next_scheduled_collect_at = new Date(Date.now() + intervalMs).toISOString();
+    config.scheduler_last_status = 'failed';
+    config.scheduler_last_error = error.message;
+    saveConfig();
+    console.error('[Scheduler] Collection failed:', error.message);
+  } finally {
+    scheduledCollectionRunning = false;
+  }
+}
+
 server.listen(port, host, () => {
   console.log(`Token Tide listening on ${baseUrl}`);
+  setTimeout(scheduledCollectionTick, 5_000);
+  setInterval(scheduledCollectionTick, 60_000).unref();
 });
 
 // 启动飞书事件长连接 (WebSocket)

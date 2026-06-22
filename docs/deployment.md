@@ -149,7 +149,7 @@ node apps/collector/src/cli.mjs sync --server http://127.0.0.1:8787
 
 ## 第六步：配置 launchd 自动启动
 
-这步让服务和采集器变成**系统级后台任务**：开机登录后自动启动，崩溃/被杀后 2 秒内自动重启，熄屏再亮屏自动恢复，每 30 分钟自动采集一次。
+这步只需要把服务端变成**系统级后台任务**：开机登录后自动启动，崩溃/被杀后自动重启。服务端内置真实调度器，会读取网页中设置的「开启自动采集」和采集间隔，不要再额外创建独立的 collector launchd 任务，否则两套任务会重复上传并触发飞书刷新防抖。
 
 ### 关键点：中文路径不能直接传给 launchd
 
@@ -171,18 +171,8 @@ cd "/Users/<你的用户名>/token_usage" || exit 1
 exec /opt/homebrew/bin/node --env-file-if-exists=.env apps/server/src/server.mjs
 ```
 
-**`~/.token-tide/start-collector.sh`**：
-
-```zsh
-#!/bin/zsh
-export LANG=en_US.UTF-8
-export LC_ALL=en_US.UTF-8
-cd "/Users/<你的用户名>/token_usage" || exit 1
-exec /opt/homebrew/bin/node apps/collector/src/cli.mjs sync --server http://127.0.0.1:8787
-```
-
 ```bash
-chmod +x ~/.token-tide/start-server.sh ~/.token-tide/start-collector.sh
+chmod +x ~/.token-tide/start-server.sh
 ```
 
 ### 6.2 创建 launchd 服务配置
@@ -213,37 +203,13 @@ chmod +x ~/.token-tide/start-server.sh ~/.token-tide/start-collector.sh
 </plist>
 ```
 
-**`~/Library/LaunchAgents/com.tokentide.collector.plist`**（采集器，每 30 分钟触发一次）：
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.tokentide.collector</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/zsh</string>
-        <string>/Users/<你的用户名>/.token-tide/start-collector.sh</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>1800</integer>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/Users/<你的用户名>/.token-tide/collector.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/<你的用户名>/.token-tide/collector.log</string>
-</dict>
-</plist>
-```
+如果旧版本曾安装 `com.tokentide.collector`，升级后执行一次
+`launchctl bootout gui/$(id -u)/com.tokentide.collector` 停用它。网页中的调度设置将成为唯一来源。
 
 ### 6.3 加载服务
 
 ```bash
 launchctl load ~/Library/LaunchAgents/com.tokentide.server.plist
-launchctl load ~/Library/LaunchAgents/com.tokentide.collector.plist
 ```
 
 ### 6.4 验证
@@ -252,7 +218,6 @@ launchctl load ~/Library/LaunchAgents/com.tokentide.collector.plist
 launchctl list | grep tokentide
 # 输出类似:
 # 90826  0  com.tokentide.server
-# -      0  com.tokentide.collector
 
 curl http://127.0.0.1:8787/healthz
 # 期望: {"status":"ok",...}
@@ -294,17 +259,12 @@ launchctl list | grep tokentide
 
 # 查看日志（实时）
 tail -f ~/.token-tide/server.log
-tail -f ~/.token-tide/collector.log
 
 # 重启服务端（修改 .env 或代码后用）
 launchctl unload ~/Library/LaunchAgents/com.tokentide.server.plist
 launchctl load   ~/Library/LaunchAgents/com.tokentide.server.plist
 
-# 重启采集器调度
-launchctl unload ~/Library/LaunchAgents/com.tokentide.collector.plist
-launchctl load   ~/Library/LaunchAgents/com.tokentide.collector.plist
-
-# 立即触发一次采集（不等 30 分钟）
+# 立即触发一次采集（也可在网页点击“立即刷新数据”）
 node apps/collector/src/cli.mjs sync --server http://127.0.0.1:8787
 ```
 
