@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+npm-debug.log
+
+# Local databases & configurations
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.env
+data/
+config.json
+events.json
+
+# Version control & CI
+.git/
+.github/
+
+# Documentation & IDEs
+docs/
+*.md
+.idea/
+.vscode/
+.antigravityignore
+app-icon-screenshot.png

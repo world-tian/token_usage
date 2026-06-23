@@ -1,4 +1,5 @@
 let currentUser = null; // { feishu_open_id, tenant_key, profile } — 从 /api/v1/me 获取
+let currentLastCollectAt = null;
 
 // ── 登录墙 ──────────────────────────────────────────────────────────────────
 function showLoginOverlay(visible) {
@@ -136,8 +137,24 @@ function watch(id) {
       if (status === 'paired' && data.device_token && data.device_id) {
         localStorage.setItem('device_token', data.device_token);
         localStorage.setItem('device_id', data.device_id);
-        loadSignatureConfig();
-        loadBoard();
+        if (currentUser) {
+          // 竞态修复：先执行绑定，绑定成功后再触发签名配置与排行榜加载！
+          fetch('/api/v1/devices/feishu-link', {
+            method: 'POST',
+            headers: { authorization: `Bearer ${data.device_token}` }
+          })
+          .then(() => {
+            loadSignatureConfig();
+            loadBoard();
+          })
+          .catch(() => {
+            loadSignatureConfig();
+            loadBoard();
+          });
+        } else {
+          loadSignatureConfig();
+          loadBoard();
+        }
       }
       if (data.receipt) showReceipt(data.receipt);
       if (status === 'aggregated') loadBoard();
@@ -206,14 +223,15 @@ function formatTime(value) {
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(value));
 }
 
-function updateSignaturePreview(row, metric) {
+function updateSignaturePreview(row, metric, collectedAt) {
   const el = document.querySelector('#signature-copy');
   if (!row) {
     el.textContent = metric === 'today' ? '今日暂无大模型用量 🌊 待自动采集' : '暂无大模型用量 🌊 待自动采集';
     return;
   }
   const usage = metric === 'today' ? `今日消耗token ${compact(row.total_tokens)}` : `累计token消耗 ${compact(row.total_tokens)}`;
-  const timePart = row.last_sync_at ? `｜${formatTime(row.last_sync_at)}` : '';
+  const displayTime = collectedAt || row.last_sync_at;
+  const timePart = displayTime ? `｜${formatTime(displayTime)}` : '';
   el.textContent = `${row.animal.emoji} ${row.animal.name} Lv.${row.animal.level}｜${usage}｜≈${money(row.cost_cny)}${timePart}`;
 }
 
@@ -231,10 +249,11 @@ async function renderSignatureForMetric(metric) {
     const row = (unionId ? data.find(r => r.canonical_key === unionId || r.feishu_union_id === unionId) : null)
       ?? (feishuId ? data.find(r => r.feishu_open_id === feishuId) : null)
       ?? (deviceId ? data.find(r => r.device_id === deviceId) : null)
-      ?? data[0] ?? null;
-    updateSignaturePreview(row, metric);
+      ?? null;
+    // total_tokens 为 0 视为该口径暂无用量，显示占位文案而非“消耗token 0”
+    updateSignaturePreview(row && row.total_tokens ? row : null, metric, currentLastCollectAt);
   } catch {
-    updateSignaturePreview(null, metric);
+    updateSignaturePreview(null, metric, currentLastCollectAt);
   }
 }
 
@@ -246,6 +265,7 @@ async function loadSignatureConfig() {
   
   const response = await fetch('/api/v1/signature/config', { headers });
   if (response.status === 401) {
+    if (!token) return; // 避免未配对设备在获取配置返回 401 时引发无限递归死循环
     localStorage.removeItem('device_token');
     localStorage.removeItem('device_id');
     await loadSignatureConfig();
@@ -253,6 +273,7 @@ async function loadSignatureConfig() {
   }
   
   const config = await response.json();
+  currentLastCollectAt = config.last_collect_at;
   
   // 更新定时采集 Checkbox 状态
   document.querySelector('#auto-collect').checked = !!config.auto_collect_enabled;
@@ -275,6 +296,7 @@ async function loadSignatureConfig() {
   // 针对配对状态对界面进行友好引导限制
   const saveBtn = document.querySelector('#save-signature');
   const editProfileBtn = document.querySelector('#edit-profile-btn');
+  const connectCard = document.querySelector('.connect-card');
   
   if (!token) {
     document.querySelector('#scheduler-state').textContent = '未配对';
@@ -282,6 +304,12 @@ async function loadSignatureConfig() {
     saveBtn.disabled = true;
     saveBtn.textContent = '请先配对设备';
     editProfileBtn.style.display = 'none';
+    
+    // 未连接设备时，确保移除已连接横幅，恢复默认面板
+    connectCard.querySelector('.connected-banner')?.remove();
+    connectCard.querySelectorAll('.card-head, .tabs, .setup-grid').forEach(el => {
+      el.style.display = '';
+    });
   } else {
     saveBtn.disabled = false;
     saveBtn.textContent = '保存显示偏好';
@@ -290,6 +318,53 @@ async function loadSignatureConfig() {
     // 更新状态文字
     document.querySelector('#scheduler-state').textContent = config.auto_collect_enabled ? '已启用' : '未启用';
     document.querySelector('#feishu-state').textContent = config.feishu_status === 'connected' ? '已连接' : '待接入 OAuth';
+
+    // 智能优化：折叠已接入设备的配对命令生成框，避免反复生成采集命令的困惑
+    if (connectCard && !connectCard.querySelector('.connected-banner')) {
+      const banner = document.createElement('div');
+      banner.className = 'connected-banner';
+      const isWin = navigator.userAgent.includes('Windows');
+      const startCmd = isWin 
+        ? `node $env:LOCALAPPDATA\\TokenTide\\bin\\token-tide.mjs daemon --server ${window.location.origin}`
+        : `node ~/.token-tide/bin/token-tide.mjs daemon --server ${window.location.origin}`;
+
+      banner.innerHTML = `
+        <div class="banner-content" style="display:flex;align-items:flex-start;justify-content:space-between;width:100%;padding:10px 0;">
+          <div style="flex:1;">
+            <div style="display:flex;align-items:center;gap:12px;">
+              <span style="font-size:24px;color:var(--cyan);">✓</span>
+              <h3 style="margin:0;color:var(--cyan);font-size:16px;">本地采集器已配对</h3>
+            </div>
+            <p style="margin:8px 0 0;font-size:13px;color:var(--text-muted);line-height:1.5;">
+              要保持网页遥控和自动同步，请确保电脑已安装 Node.js 22+，并在终端保持运行以下长连接守护进程：
+            </p>
+            <div style="display:flex; gap:8px; margin-top:8px;">
+              <code style="flex:1; display:block; padding:8px 12px; background:var(--bg-body); border:1px solid var(--border-color); border-radius:6px; font-size:12px; color:var(--text-color); font-family:monospace; word-break:break-all;" id="daemon-cmd">${startCmd}</code>
+              <button class="button ghost small" onclick="navigator.clipboard.writeText(document.getElementById('daemon-cmd').textContent); this.textContent='已复制'; setTimeout(()=>this.textContent='复制', 2000);">复制</button>
+            </div>
+          </div>
+          <button id="reconnect-btn" class="button ghost small" style="margin-left:16px;white-space:nowrap;margin-top:4px;">连接新设备</button>
+        </div>
+      `;
+      connectCard.insertBefore(banner, connectCard.firstChild);
+      
+      // 隐藏原本的连接步骤
+      connectCard.querySelectorAll('.card-head, .tabs, .setup-grid, .pairing').forEach(el => {
+        if (el !== banner) el.style.display = 'none';
+      });
+
+      // 连接新设备按钮点击事件
+      banner.querySelector('#reconnect-btn').addEventListener('click', () => {
+        banner.remove();
+        connectCard.querySelectorAll('.card-head, .tabs, .setup-grid').forEach(el => {
+          el.style.display = '';
+        });
+        const createBtn = document.querySelector('#create-code');
+        createBtn.disabled = false;
+        createBtn.textContent = '生成配对命令';
+        document.querySelector('#pairing').classList.add('hidden');
+      });
+    }
   }
   
   const statusEl = document.querySelector('#signature-status');
@@ -301,8 +376,11 @@ async function loadSignatureConfig() {
     statusEl.className = 'status-warn';
   }
   
-  updateSignaturePreview(config.preview, config.metric);
+  // 后端 preview 现在是权威值：null 表示该口径（今日/累计）暂无用量，直接显示占位文案。
+  // 不再回退到依赖 cookie 的 /api/v1/leaderboard，避免竞态或 401 把已显示的数据重新刷成 0。
+  updateSignaturePreview(config.preview, config.metric, currentLastCollectAt);
 }
+
 
 // 绑定飞书签名类型选择
 document.querySelectorAll('#metric-choice .choice').forEach((button) => button.addEventListener('click', () => {
@@ -385,10 +463,21 @@ document.querySelector('#refresh-feishu-signature')?.addEventListener('click', a
   try {
     const response = await fetch('/api/v1/feishu/preview/refresh', { method: 'POST', headers: { authorization: `Bearer ${token}` } });
     const result = await response.json();
-    if (result.status === 'success') { button.textContent = `已刷新 ${result.count} 个签名`; toast(`已通知飞书刷新 ${result.count} 个签名`); }
-    else if (result.status === 'waiting_for_preview_token') { button.textContent = '请先粘贴一次飞书签名'; toast('请先在飞书粘贴一次签名链接'); }
-    else if (result.status === 'waiting_for_app_credentials') { button.textContent = '飞书应用未配置'; toast('飞书应用未配置'); }
-    else { button.textContent = '刷新失败，请查看服务日志'; toast('刷新失败，请查看服务日志'); }
+    if (result.status === 'success') {
+      button.textContent = `已刷新 ${result.count} 个签名`;
+      toast(`已通知飞书刷新 ${result.count} 个签名`);
+      await loadSignatureConfig();
+    } else if (result.status === 'waiting_for_preview_token') {
+      button.textContent = '请先粘贴一次飞书签名';
+      toast('请先在飞书粘贴一次签名链接');
+    } else if (result.status === 'waiting_for_app_credentials') {
+      button.textContent = '飞书应用未配置';
+      toast('飞书应用未配置');
+    } else {
+      button.textContent = '刷新失败';
+      toast(`刷新失败：${result.error || result.status}`);
+      console.error('[feishu preview refresh] 失败详情:', result);
+    }
   } catch {
     button.textContent = '刷新失败';
     toast('刷新失败');
@@ -472,7 +561,6 @@ document.querySelector('#refresh-board').addEventListener('click', async () => {
 // 立即刷新数据：spawn 采集器拉最新数据 → 更新排行榜 → 推送飞书签名
 document.querySelector('#refresh-now').addEventListener('click', async (event) => {
   const button = event.currentTarget;
-  const activeMetric = document.querySelector('#metric-choice .choice.active')?.dataset.value || 'today';
   button.disabled = true;
   button.textContent = '采集中…';
   toast('正在采集最新数据，请稍候…');
@@ -487,18 +575,14 @@ document.querySelector('#refresh-now').addEventListener('click', async (event) =
       accepted = result.accepted || 0;
       feishuPushed = result.feishu_push === 'success';
     }
-    // 采集完后刷新页面数据
-    await Promise.all([loadBoard(), loadSignatureConfig(), renderSignatureForMetric(activeMetric)]);
+    // 采集完后稍等两秒再刷新页面数据，给客户端一些上传时间
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    // loadSignatureConfig 已按当前口径用后端权威 preview 更新签名框，无需再调 renderSignatureForMetric（避免竞态把数据刷回 0）
+    await Promise.all([loadBoard(), loadSignatureConfig()]);
     const stamp = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    document.querySelector('#refresh-stamp').textContent = `数据刷新于 ${stamp}`;
-    button.textContent = '已刷新';
-    if (feishuPushed) {
-      toast(`采集完成，新增 ${accepted} 条，飞书签名已推送`);
-    } else if (accepted > 0) {
-      toast(`采集完成，新增 ${accepted} 条，签名下次访问自动更新`);
-    } else {
-      toast('已是最新数据，飞书签名实时生效');
-    }
+    document.querySelector('#refresh-stamp').textContent = `最后点击触发于 ${stamp}`;
+    button.textContent = '已下发';
+    toast('已向在线设备下发采集指令，数据将在几秒内更新');
   } catch {
     button.textContent = '刷新失败，请重试';
     toast('采集失败，请检查服务状态');

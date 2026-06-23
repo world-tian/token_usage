@@ -45,8 +45,8 @@
         <div class="setup-grid">
           <div class="setup-option primary-option">
             <span class="recommended">推荐 · 当前可运行</span>
-            <h3>终端命令</h3>
-            <p>先生成一次性配对码，再复制命令到任意终端目录运行。</p>
+            <h3>终端命令长连接</h3>
+            <p>需安装 <a href="https://nodejs.org" target="_blank" style="color:var(--cyan)">Node.js 22+</a>。生成配对码后在终端运行，将自动建立守护进程和长连接。</p>
             <button id="create-code" class="button primary">生成配对命令</button>
           </div>
           <div class="setup-option disabled-option">
@@ -193,6 +193,6 @@
       <p style="color:var(--text-muted);font-size:12px;margin:0;opacity:.6;">仅同一飞书企业的成员可见同一榜单</p>
     </div>
 
-    <script type="module" src="/app.js?v=0.2.9"></script>
+    <script type="module" src="/app.js?v=0.3.0"></script>
   </body>
 </html>

@@ -3,6 +3,25 @@ import { createHash, randomUUID } from 'node:crypto';
 import { homedir, platform } from 'node:os';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { env, execPath, argv } from 'process';
+
+// 自动检测并开启 --experimental-sqlite flag 以读取本地 SQLite 数据库
+let hasSqlite = true;
+try {
+  await import('node:sqlite');
+} catch {
+  hasSqlite = false;
+}
+
+if (!hasSqlite && process.version.startsWith('v22.') && !env.SQLITE_RESPAWNED) {
+  const result = spawnSync(execPath, ['--experimental-sqlite', ...argv.slice(1)], {
+    stdio: 'inherit',
+    env: { ...env, SQLITE_RESPAWNED: 'true' }
+  });
+  process.exit(result.status ?? 0);
+}
+
 import { collectLocalUsage, localSourceStatus, summarize } from './adapters.mjs';
 
 // 本地凭据：按 server 保存 device_token / device_id，保证同一终端身份稳定，不必每次换配对码
@@ -51,10 +70,17 @@ Commands:
   sync        Scan real local Codex/Claude usage and upload counters only.
               First run needs --code to pair; the device token is saved to
               ~/.token-tide/credentials.json and reused so your identity stays stable.
+  daemon      Start as a background daemon to listen for collect commands from the remote server
+              and automatically sync every 30 minutes.
   scan        Preview real local usage without uploading
   demo-sync   Upload synthetic data for development testing only
   doctor      Check runtime and server connectivity
   help        Show this help
+
+Options:
+  --codexRoot <path>          Custom root directory for Codex logs (default: ~/.codex/sessions)
+  --claudeRoot <path>         Custom root directory for Claude Code logs (default: ~/.claude)
+  --antigravityRoot <path>    Custom root directory for Antigravity logs (default: ~/.gemini/antigravity-ide)
 
 The collector parses local JSONL files but only emits timestamps, tools, model names,
 and token counters. It never uploads prompts, responses, code, file paths, or API keys.`);
@@ -91,12 +117,12 @@ function demoEvents() {
   });
 }
 
-async function doctor(server) {
+async function doctor(server, options = {}) {
   console.log(`Platform: ${platform()}`);
   console.log(`Node: ${process.version}`);
   const health = await requestJson(`${server}/healthz`);
   console.log(`Server: ${health.status} (${health.version})`);
-  const sources = await localSourceStatus();
+  const sources = await localSourceStatus(options);
   sources.forEach((source) => console.log(`Source ${source.root}: ${source.exists ? 'found' : 'not found'}`));
   console.log('Privacy check: only usage counters are eligible for upload.');
 }
@@ -114,9 +140,9 @@ function printSummary(result) {
   return summary;
 }
 
-async function scan() {
+async function scan(options = {}) {
   console.log('Scanning real local Codex and Claude Code usage…');
-  const result = await collectLocalUsage();
+  const result = await collectLocalUsage(options);
   printSummary(result);
   console.log('Preview only: nothing was uploaded.');
   return result;
@@ -135,25 +161,26 @@ async function uploadEvents(server, token, events) {
   return receipts;
 }
 
-async function sync(server, code) {
+async function sync(server, code, options = {}) {
   console.log('1/3 Scanning real local Codex and Claude Code usage…');
-  const result = await collectLocalUsage();
+  const result = await collectLocalUsage(options);
   const summary = printSummary(result);
   if (summary.events === 0) throw new Error('no supported usage events found; run doctor to inspect source availability');
 
   // 优先复用已保存的设备身份；只有首次（无凭据）才需要 --code 配对
   const stored = loadCredentials()[server];
   let token = stored?.device_token || null;
-  if (!token) {
-    if (!code) throw new Error('first run needs --code from the /connect page; afterwards just run "token-tide sync" (no code)');
-    console.log('2/3 Pairing device (first time)…');
+  if (code) {
+    console.log(token ? `2/3 Reusing saved device identity (${stored.device_id}) with new code…` : '2/3 Pairing device (first time)…');
     const device = await requestJson(`${server}/api/v1/devices/exchange`, {
       method: 'POST',
-      body: JSON.stringify({ code, platform: platform(), client_nonce: randomUUID() })
+      body: JSON.stringify({ code, existing_token: token, platform: platform(), client_nonce: randomUUID() })
     });
     token = device.device_token;
     saveCredential(server, { device_token: device.device_token, device_id: device.device_id, paired_at: new Date().toISOString() });
     console.log(`    Paired; identity saved to ${credentialsFile}`);
+  } else if (!token) {
+    throw new Error('first run needs --code from the /connect page; afterwards just run "token-tide sync" (no code)');
   } else {
     console.log(`2/3 Reusing saved device identity (${stored.device_id})…`);
   }
@@ -199,14 +226,90 @@ async function demoSync(server, code) {
   console.log(`  Receipt: ${receipt.request_id}`);
 }
 
+async function daemon(server, options) {
+  let stored = loadCredentials()[server];
+  let token = stored?.device_token || null;
+  if (!token) {
+    if (options.code) {
+      console.log('No credentials found. Initializing pairing via sync...');
+      await sync(server, String(options.code), options);
+      stored = loadCredentials()[server];
+      token = stored?.device_token || null;
+    }
+    if (!token) throw new Error('Daemon needs a paired device. Please run "token-tide sync --code <CODE>" first.');
+  }
+
+  console.log(`Starting Token Tide Daemon...`);
+  console.log(`Device ID: ${stored.device_id}`);
+  console.log(`Server: ${server}`);
+  console.log('Press Ctrl+C to stop.');
+
+  // Autonomous periodic collection every 30 minutes
+  setInterval(async () => {
+    try {
+      console.log(`[${new Date().toISOString()}] Autonomous periodic sync...`);
+      await sync(server, '', options);
+    } catch (e) {
+      console.error(`[${new Date().toISOString()}] Periodic sync failed: ${e.message}`);
+    }
+  }, 30 * 60 * 1000);
+
+  // Heartbeat / Command listener loop via SSE
+  while (true) {
+    try {
+      console.log(`[${new Date().toISOString()}] Connecting to server command stream...`);
+      const response = await fetch(`${server}/api/v1/collect/stream`, {
+        headers: { authorization: `Bearer ${token}` }
+      });
+      if (!response.ok) {
+        throw new Error(`Server returned ${response.status}`);
+      }
+
+      console.log(`[${new Date().toISOString()}] Connected to remote command stream.`);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        
+        let newlineIndex;
+        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newlineIndex).trim();
+          buffer = buffer.slice(newlineIndex + 1);
+          
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.type === 'collect_now') {
+                console.log(`[${new Date().toISOString()}] Received 'collect_now' command from server! Executing sync...`);
+                await sync(server, '', options).catch(e => console.error(`Manual sync failed: ${e.message}`));
+              }
+            } catch (e) {
+              console.warn('Failed to parse SSE data:', line);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`[${new Date().toISOString()}] SSE connection dropped: ${error.message}. Reconnecting in 5 seconds...`);
+    }
+    // Wait 5 seconds before reconnecting
+    await new Promise(resolve => setTimeout(resolve, 5000));
+  }
+}
+
 const { command, options } = args(process.argv.slice(2));
 const server = String(options.server || process.env.TOKEN_TIDE_SERVER || 'http://127.0.0.1:8787').replace(/\/$/, '');
 
 try {
   if (command === 'help' || command === '--help' || command === '-h') usage();
-  else if (command === 'doctor') await doctor(server);
-  else if (command === 'scan') await scan();
-  else if (command === 'sync') await sync(server, String(options.code || ''));
+  else if (command === 'doctor') await doctor(server, options);
+  else if (command === 'scan') await scan(options);
+  else if (command === 'sync') await sync(server, String(options.code || ''), options);
+  else if (command === 'daemon') await daemon(server, options);
   else if (command === 'demo-sync') await demoSync(server, String(options.code || ''));
   else {
     usage();

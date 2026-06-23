@@ -114,6 +114,10 @@ function loadEvents() {
     for (const row of db.prepare('SELECT event_key, device_id, event_json FROM events ORDER BY rowid').all()) {
       try {
         const event = JSON.parse(row.event_json);
+        if (event && (event.pricing_context === 'demo' || (event.observed_model && event.observed_model.endsWith('-demo')))) {
+          db.prepare('DELETE FROM events WHERE event_key = ?').run(row.event_key);
+          continue;
+        }
         state.events.push({ deviceId: row.device_id, event });
         state.eventKeys.add(row.event_key ?? stableEventKey(row.device_id, event));
       } catch {}
@@ -211,32 +215,80 @@ function sessionCookie(token, maxAge = 2592000) {
   return `tt_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Secure; Max-Age=${maxAge}; Path=/`;
 }
 
-// 按 union_id（优先）或 open_id 找第一个匹配设备
 function findDeviceByFeishuId(feishuId, isUnionId = false) {
   if (!feishuId) return null;
+  let bestDid = null;
+  let maxTime = -1;
   for (const [did, cfg] of Object.entries(dbConfig.devices)) {
     const fi = cfg.feishu_identity;
     if (!fi) continue;
-    if (isUnionId ? fi.union_id === feishuId : fi.open_id === feishuId) return did;
+    const match = isUnionId ? fi.union_id === feishuId : fi.open_id === feishuId;
+    if (match) {
+      const time = cfg.last_collect_at ? new Date(cfg.last_collect_at).getTime() : 0;
+      if (time >= maxTime) { maxTime = time; bestDid = did; }
+    }
   }
+  if (bestDid) return bestDid;
+  
   // 如果按 union_id 找不到，再试 open_id
   if (isUnionId) {
     for (const [did, cfg] of Object.entries(dbConfig.devices)) {
-      if (cfg.feishu_identity?.open_id === feishuId) return did;
+      if (cfg.feishu_identity?.open_id === feishuId) {
+        const time = cfg.last_collect_at ? new Date(cfg.last_collect_at).getTime() : 0;
+        if (time >= maxTime) { maxTime = time; bestDid = did; }
+      }
     }
   }
-  return null;
+  return bestDid;
 }
 
-function addPreviewToken(deviceId, previewToken) {
-  if (!previewToken) return;
+// 飞书 preview_token 形如 w00... 的 base64url 串；过滤掉测试/脏数据，避免污染 batchUpdate 批次
+function isLikelyPreviewToken(token) {
+  return typeof token === 'string' && /^[A-Za-z0-9_-]{20,}$/.test(token);
+}
+
+// 兼容旧的纯字符串存储，统一成 { t, url, at } 条目
+function previewTokenEntries(cfg) {
+  return (cfg?.preview_tokens || [])
+    .map((e) => (typeof e === 'string' ? { t: e, url: null, at: null } : e))
+    .filter((e) => e && isLikelyPreviewToken(e.t));
+}
+
+// 该 URL 是否指向「本账号正确的签名 URL」(即 /signature?feishu_id=<本人 union_id/open_id>)。
+// device_id=default、主页、旧域名等会解析成空数据，刷新它们会把签名刷成「待自动采集」，必须排除。
+function urlMatchesAccount(urlStr, unionId, openId) {
+  if (!urlStr || (!unionId && !openId)) return false;
+  try {
+    const u = new URL(urlStr);
+    if (!u.pathname.endsWith('/signature')) return false;
+    const fid = u.searchParams.get('feishu_id');
+    return !!fid && (fid === unionId || fid === openId);
+  } catch { return false; }
+}
+
+function addPreviewToken(deviceId, previewToken, url = null) {
+  if (!isLikelyPreviewToken(previewToken)) return;
   const config = getDeviceConfig(deviceId || 'default');
-  const tokens = new Set(config.preview_tokens || []);
-  tokens.add(previewToken);
-  config.preview_tokens = [...tokens].slice(-100);
+  // 注意：不要按 URL 去重！个性签名和每条聊天消息是“同一 URL 但不同 token”的独立预览实例，
+  // 各自的 token 都要保留，否则聊天里的新 token 会顶掉签名的 token，导致签名永远刷不到。
+  let entries = previewTokenEntries(config).filter((e) => e.t !== previewToken);
+  entries.push({ t: previewToken, url, at: new Date().toISOString() });
+  config.preview_tokens = entries.slice(-100);
   config.preview_registered_at = new Date().toISOString();
   config.updated_at = new Date().toISOString();
   saveConfig();
+}
+
+// 从所有设备配置里剔除指定的 token（用于清理飞书已判失效的 token，避免反复拖垮整批刷新）
+function removePreviewTokens(tokens) {
+  const drop = new Set(tokens);
+  let changed = false;
+  for (const cfg of Object.values(dbConfig.devices)) {
+    const entries = previewTokenEntries(cfg);
+    const kept = entries.filter((e) => !drop.has(e.t));
+    if (kept.length !== entries.length) { cfg.preview_tokens = kept; changed = true; }
+  }
+  if (changed) saveConfig();
 }
 
 async function getFeishuClient() {
@@ -253,37 +305,93 @@ async function getFeishuClient() {
 
 const _previewCooldown = new Map(); // deviceId → last push timestamp
 async function refreshFeishuPreview(deviceId, reason = 'usage_updated') {
-  const config = getDeviceConfig(deviceId || 'default');
-  const previewTokens = [...new Set(config.preview_tokens || [])];
+  const currentConfig = getDeviceConfig(deviceId || 'default');
+  const unionId = currentConfig.feishu_identity?.union_id;
+  const openId = currentConfig.feishu_identity?.open_id;
+  const feishuId = unionId || openId;
+
+  // 收集本账号相关设备(当前 + default + 同账号其它设备)的 token 条目
+  const sources = [currentConfig, getDeviceConfig('default')];
+  if (feishuId) {
+    for (const [did, cfg] of Object.entries(dbConfig.devices)) {
+      if (did === deviceId || did === 'default') continue;
+      const fi = cfg.feishu_identity;
+      if (fi && (fi.union_id === feishuId || fi.open_id === feishuId)) sources.push(cfg);
+    }
+  }
+
+  // 关键：只刷新「指向本账号正确签名 URL(feishu_id 匹配)」的 token。
+  // 历史脏 token(device_id=default / 主页 / 旧域名)会解析成空数据，刷新它们会把签名刷成「待自动采集」。
+  const byToken = new Map();
+  for (const cfg of sources) {
+    for (const e of previewTokenEntries(cfg)) {
+      if (!urlMatchesAccount(e.url, unionId, openId)) continue;
+      byToken.set(e.t, e);
+    }
+  }
+  const previewTokens = [...byToken.keys()];
   if (!previewTokens.length) return { status: 'waiting_for_preview_token', count: 0 };
-  // 飞书 batchUpdate 有频率限制，2 分钟内同一设备只推一次
+  
+  // 飞书 batchUpdate 有频率限制，2 分钟内同一设备只推一次（手动触发除外）
   const now = Date.now();
   const last = _previewCooldown.get(deviceId) || 0;
-  if (now - last < 2 * 60_000) return { status: 'rate_limited_local', count: previewTokens.length };
-  _previewCooldown.set(deviceId, now);
+  const isManual = reason.startsWith('manual');
+  if (!isManual && now - last < 2 * 60_000) return { status: 'rate_limited_local', count: previewTokens.length };
+  if (!isManual) _previewCooldown.set(deviceId, now);
+  
   if (!feishuAppId || !feishuAppSecret) {
-    config.preview_refresh_status = 'waiting_for_app_credentials';
-    config.preview_refresh_error = 'FEISHU_APP_ID / FEISHU_APP_SECRET not configured';
+    currentConfig.preview_refresh_status = 'waiting_for_app_credentials';
+    currentConfig.preview_refresh_error = 'FEISHU_APP_ID / FEISHU_APP_SECRET not configured';
     saveConfig();
-    return { status: config.preview_refresh_status, count: previewTokens.length };
+    return { status: currentConfig.preview_refresh_status, count: previewTokens.length };
   }
+  const fmtErr = (error) => {
+    const apiError = error.response?.data || {};
+    const code = apiError.code ?? error.code;
+    const msg = apiError.msg || error.message;
+    const logId = apiError.log_id || error.response?.headers?.['x-tt-logid'];
+    return [code != null ? `code=${code}` : null, msg, logId ? `log_id=${logId}` : null].filter(Boolean).join(' | ');
+  };
+  const recordStatus = (status, error = null) => {
+    currentConfig.preview_refresh_status = status;
+    currentConfig.preview_refresh_error = error;
+    if (status === 'success') {
+      currentConfig.preview_last_refreshed_at = new Date().toISOString();
+      currentConfig.preview_refresh_reason = reason;
+    }
+    saveConfig();
+  };
+
+  const client = await getFeishuClient();
   try {
-    const client = await getFeishuClient();
     const result = await client.im.v2.urlPreview.batchUpdate({ data: { preview_tokens: previewTokens } });
     if (result?.code) throw new Error(`${result.code}: ${result.msg || 'unknown Feishu error'}`);
-    config.preview_refresh_status = 'success';
-    config.preview_refresh_error = null;
-    config.preview_last_refreshed_at = new Date().toISOString();
-    config.preview_refresh_reason = reason;
-    saveConfig();
+    recordStatus('success');
+    console.log(`[Feishu Preview] Batch refresh success: ${previewTokens.length} token(s), reason=${reason}`);
     return { status: 'success', count: previewTokens.length };
-  } catch (error) {
-    const apiError = error.response?.data;
-    const errorDetail = apiError?.msg ? `${apiError.code || 'Feishu'}: ${apiError.msg}` : error.message;
-    config.preview_refresh_status = 'failed';
-    config.preview_refresh_error = errorDetail;
-    saveConfig();
-    console.error('[Feishu Preview] Batch refresh failed:', errorDetail);
+  } catch (batchError) {
+    // 整批失败通常是其中某个 token 已过期/失效（飞书是整批校验）。逐个重试，把失效的剔除，
+    // 这样签名/聊天里仍然有效的 token（含个性签名那条）能刷新成功，且失效 token 自动自愈。
+    console.warn('[Feishu Preview] Batch failed, retrying individually:', fmtErr(batchError));
+    const okTokens = [];
+    const badTokens = [];
+    let lastErr = batchError;
+    for (const t of previewTokens) {
+      try {
+        const r = await client.im.v2.urlPreview.batchUpdate({ data: { preview_tokens: [t] } });
+        if (r?.code) throw new Error(`${r.code}: ${r.msg || 'unknown Feishu error'}`);
+        okTokens.push(t);
+      } catch (e) { badTokens.push(t); lastErr = e; }
+    }
+    if (badTokens.length) removePreviewTokens(badTokens);
+    if (okTokens.length) {
+      recordStatus('success');
+      console.log(`[Feishu Preview] Individual refresh: ${okTokens.length} ok, ${badTokens.length} pruned, reason=${reason}`);
+      return { status: 'success', count: okTokens.length, pruned: badTokens.length };
+    }
+    const errorDetail = fmtErr(lastErr);
+    recordStatus('failed', errorDetail);
+    console.error('[Feishu Preview] Refresh failed (all tokens):', errorDetail);
     return { status: 'failed', count: previewTokens.length, error: errorDetail };
   }
 }
@@ -296,6 +404,7 @@ const state = {
   eventKeys: new Set(),
   events: [],
   streams: new Map(),
+  daemonStreams: new Map(), // map of deviceId -> Set(Response)
   signatureRequests: [],
   previewEvents: [],
   get signatureConfig() {
@@ -324,6 +433,7 @@ loadEvents();
 function json(response, status, data) {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   response.end(JSON.stringify(data));
+  return true;
 }
 
 function escapeHtml(value) {
@@ -436,6 +546,7 @@ function leaderboard(items = state.events, seedDeviceIds = [...new Set(state.eve
   }
   for (const item of items) {
     if (!isAllowed(item.deviceId)) continue;
+    if (item.event && (item.event.pricing_context === 'demo' || (item.event.observed_model && item.event.observed_model.endsWith('-demo')))) continue;
     const row = getOrCreate(item.deviceId);
     row.total_tokens += totalTokens(item.event);
     row.tide_points += tidePoints(item.event);
@@ -463,6 +574,14 @@ function leaderboard(items = state.events, seedDeviceIds = [...new Set(state.eve
   })).sort((a, b) => b.total_tokens - a.total_tokens).map((row, index) => ({ rank: index + 1, ...row }));
 }
 
+// 签名预览专用：只用 items 内实际出现的设备做种子，避免给“今日/累计”空口径伪造 total_tokens:0 的幽灵行。
+// 空口径返回 null → 由 buildSignatureText 渲染“暂无用量”占位文案，而不是误导性的“消耗token 0”。
+function signatureRow(items, match) {
+  const seeds = [...new Set(items.map((e) => e.deviceId))];
+  const board = leaderboard(items, seeds);
+  return (match ? board.find(match) : board[0]) || null;
+}
+
 function dateKey(value) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: organizationTimeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(value));
 }
@@ -474,7 +593,7 @@ function buildSignatureText(row, metric, collectedAt = null) {
   const cost = new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY', maximumFractionDigits: 2 }).format(row.cost_cny || 0);
   const usage = metric === 'today' ? `今日消耗token ${tokens}` : `累计token消耗 ${tokens}`;
   const displayTime = collectedAt || row.last_sync_at;
-  const timePart = displayTime ? `｜${new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(displayTime))}` : '';
+  const timePart = displayTime ? `｜${new Intl.DateTimeFormat('zh-CN', { timeZone: organizationTimeZone, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(displayTime))}` : '';
   return `${row.animal.emoji} ${row.animal.name} Lv.${row.animal.level}｜${usage}｜≈${cost}${timePart}`;
 }
 
@@ -487,14 +606,14 @@ function signatureConfigResponseForDevice(deviceId, session = null) {
     ? state.events.filter(item => (getDeviceConfig(item.deviceId).feishu_identity?.open_id || item.deviceId) === feishuId)
     : state.events.filter(item => item.deviceId === deviceId);
   const items = devConfig.metric === 'today' ? deviceEvents.filter((item) => dateKey(item.event.occurred_at) === today) : deviceEvents;
-  const canonicalKey = feishuId || deviceId;
-  const preview = leaderboard(items).find(row => row.canonical_key === canonicalKey || row.device_id === deviceId) || null;
+  const unionId = session?.union_id || devConfig.feishu_identity?.union_id;
+  const canonicalKey = unionId || feishuId || deviceId;
+  const preview = signatureRow(items, row => row.canonical_key === canonicalKey || row.device_id === deviceId);
   const lastCollectAt = devConfig.last_collect_at || null;
   const nextAt = devConfig.auto_collect_enabled
     ? (devConfig.next_scheduled_collect_at || new Date(Date.now() + devConfig.interval_minutes * 60_000).toISOString())
     : null;
   // 签名 URL：优先用 union_id（跨应用稳定），否则 open_id，最后 device_id
-  const unionId = session?.union_id || devConfig.feishu_identity?.union_id;
   const signatureUrl = new URL('/signature', baseUrl);
   if (unionId) signatureUrl.searchParams.set('feishu_id', unionId);
   else if (feishuId) signatureUrl.searchParams.set('feishu_id', feishuId);
@@ -518,14 +637,19 @@ function generateLinkPreviewResponse(targetUrlStr, previewToken) {
   } catch (e) {
     console.error('[Link Preview] Failed to parse target URL:', targetUrlStr, e);
   }
-  // feishu_id 参数可以是 union_id 或 open_id，优先按 union_id 查
+
+  // Resolve device if only feishu_id is provided
   if (feishuId && !deviceId) {
     deviceId = findDeviceByFeishuId(feishuId, true) || findDeviceByFeishuId(feishuId, false);
   }
 
   const config = deviceId ? getDeviceConfig(deviceId) : state.signatureConfig;
   const today = dateKey(new Date());
-  const canonicalKey = feishuId || deviceId;
+  const unionId = config.feishu_identity?.union_id;
+  const openId = config.feishu_identity?.open_id;
+  const canonicalKey = unionId || openId || feishuId || deviceId;
+
+  // Exact matching logic from GET /signature
   const sourceEvents = canonicalKey
     ? state.events.filter(item => {
         const fi = getDeviceConfig(item.deviceId).feishu_identity;
@@ -534,20 +658,22 @@ function generateLinkPreviewResponse(targetUrlStr, previewToken) {
           : item.deviceId === deviceId;
       })
     : state.events;
+
   const items = config.metric === 'today' ? sourceEvents.filter((item) => dateKey(item.event.occurred_at) === today) : sourceEvents;
 
   const row = canonicalKey
-    ? (leaderboard(items).find(r => r.canonical_key === canonicalKey || r.device_id === deviceId) || null)
-    : (leaderboard(items)[0] || null);
-    
+    ? signatureRow(items, r => r.canonical_key === canonicalKey || r.device_id === deviceId)
+    : signatureRow(items);
+
   const text = buildSignatureText(row, config.metric, config.last_collect_at);
 
   // 飞书 url.preview.get 应答：inline 必填，title 为签名要显示的文字（i18n_title 优先级更高，这里用单语言 title 即可）
-  // inline.url 指向主页：别人点我的签名预览，直接跳到主页去登录并配置他自己的签名
-  let homeUrl = null;
-  try { homeUrl = new URL('/', targetUrlStr).toString(); } catch {}
+  // inline.url 必须指向签名 URL 本身：点击/飞书解析链接目标时会重新预览它，仍解析成本人数据。
+  // 切勿指向主页 '/'：主页没有 feishu_id，会解析成空 → 点击签名后卡片被刷成「待自动采集」。
+  // 引导他人配置自己签名的入口，放在 /signature 页面正文里（已有「进入主页」链接）。
+  const clickUrl = targetUrlStr;
   const inline = { title: text };
-  if (homeUrl) inline.url = { copy_url: homeUrl, pc: homeUrl, ios: homeUrl, android: homeUrl, web: homeUrl };
+  if (clickUrl) inline.url = { copy_url: clickUrl, pc: clickUrl, ios: clickUrl, android: clickUrl, web: clickUrl };
   return { inline };
 }
 
@@ -581,9 +707,21 @@ async function api(request, response, url) {
     const pairingId = state.pairingsByCode.get(String(body.code || '').toUpperCase());
     const pairing = pairingId ? state.pairings.get(pairingId) : null;
     if (!pairing || pairing.expiresAt < Date.now()) return json(response, 400, { error: 'invalid or expired device code' });
-    const token = randomUUID() + randomUUID();
-    const deviceId = randomUUID();
-    const device = { id: deviceId, token, pairingId, platform: body.platform || 'unknown', createdAt: Date.now() };
+    
+    let token = body.existing_token;
+    let deviceId = null;
+    let device = token ? state.devices.get(token) : null;
+
+    if (device) {
+      deviceId = device.id;
+      // Emit paired for existing device
+      emitPairing(pairing, 'paired', { platform: device.platform, device_id: device.id, device_token: token });
+      return json(response, 200, { device_id: device.id, device_token: token, expires_in: 3600 });
+    }
+
+    token = randomUUID() + randomUUID();
+    deviceId = randomUUID();
+    device = { id: deviceId, token, pairingId, platform: body.platform || 'unknown', createdAt: Date.now() };
     state.devices.set(token, device);
     
     // 初始化并持久化该设备专属配置，支持重启后通过 token 恢复
@@ -752,7 +890,21 @@ async function api(request, response, url) {
     if (!device) return json(response, 401, { error: 'invalid or missing device token' });
     const body = await readJson(request);
     if (typeof body.display_name === 'string' && body.display_name.trim().length > 0) {
-      saveDeviceConfig(device.id, null, { display_name: body.display_name.trim() });
+      const cfg = getDeviceConfig(device.id);
+      const fi = cfg.feishu_identity;
+      const unionId = fi?.union_id;
+      const openId = fi?.open_id;
+      // 同步修改属于该飞书账号的所有设备的名称
+      for (const [did, deviceCfg] of Object.entries(dbConfig.devices)) {
+        if (deviceCfg.feishu_identity) {
+          const match = unionId ? deviceCfg.feishu_identity.union_id === unionId : deviceCfg.feishu_identity.open_id === openId;
+          if (match || did === device.id) {
+            saveDeviceConfig(did, null, { display_name: body.display_name.trim() });
+          }
+        } else if (did === device.id) {
+          saveDeviceConfig(did, null, { display_name: body.display_name.trim() });
+        }
+      }
     }
     return json(response, 200, { profile: getDeviceConfig(device.id).profile });
   }
@@ -871,8 +1023,16 @@ async function api(request, response, url) {
         const previewToken = event.context.preview_token;
         const targetUrlStr = event.context.url;
         let previewDeviceId = null;
-        try { previewDeviceId = new URL(targetUrlStr).searchParams.get('device_id'); } catch {}
-        addPreviewToken(previewDeviceId || 'default', previewToken);
+        let feishuId = null;
+        try { 
+          const u = new URL(targetUrlStr);
+          previewDeviceId = u.searchParams.get('device_id');
+          feishuId = u.searchParams.get('feishu_id');
+        } catch {}
+        if (!previewDeviceId && feishuId) {
+          previewDeviceId = findDeviceByFeishuId(feishuId, true) || findDeviceByFeishuId(feishuId, false);
+        }
+        addPreviewToken(previewDeviceId || 'default', previewToken, targetUrlStr);
         remember(state.previewEvents, { type: 'url.preview.get', at: new Date().toISOString(), device_id: previewDeviceId, url: targetUrlStr });
         const responseData = generateLinkPreviewResponse(targetUrlStr, previewToken);
         console.log(`[Link Preview - Webhook] Replied successfully | Text: ${responseData.inline.title}`);
@@ -883,30 +1043,56 @@ async function api(request, response, url) {
     return json(response, 400, { error: 'unsupported feishu event type' });
   }
 
-  // 立即触发采集：spawn 本地 collector，采集完后主动刷新飞书签名
+  // 客户端 SSE 心跳长连接
+  if (request.method === 'GET' && url.pathname === '/api/v1/collect/stream') {
+    const device = getDeviceByRequest(request);
+    if (!device) return json(response, 401, { error: 'invalid or missing device token' });
+    
+    response.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+      'X-Accel-Buffering': 'no'
+    });
+    response.write(': keepalive\n\n');
+
+    if (!state.daemonStreams.has(device.id)) {
+      state.daemonStreams.set(device.id, new Set());
+    }
+    const clients = state.daemonStreams.get(device.id);
+    clients.add(response);
+
+    const keepAlive = setInterval(() => {
+      response.write(': keepalive\n\n');
+    }, 30_000);
+
+    request.on('close', () => {
+      clearInterval(keepAlive);
+      clients.delete(response);
+      if (clients.size === 0) state.daemonStreams.delete(device.id);
+    });
+    return true;
+  }
+
+  // 立即触发采集：通过 SSE 向绑定的在线 daemon 发送采集指令
   if (request.method === 'POST' && url.pathname === '/api/v1/collect') {
     const device = getDeviceByRequest(request);
     if (!device) return json(response, 401, { error: 'invalid or missing device token' });
-    return new Promise((resolve) => {
-      let output = '';
-      const proc = spawn(process.execPath, [collectorSource, 'sync', '--server', `http://127.0.0.1:${port}`], {
-        env: { ...process.env },
-        stdio: ['ignore', 'pipe', 'pipe']
-      });
-      proc.stdout.on('data', (d) => { output += d.toString(); });
-      proc.stderr.on('data', (d) => { output += d.toString(); });
-      proc.on('error', (err) => resolve(json(response, 500, { ok: false, output: err.message })));
-      const timer = setTimeout(() => { proc.kill(); resolve(json(response, 504, { ok: false, output: 'collector timeout after 60s' })); }, 60_000);
-      proc.on('close', async (code) => {
-        clearTimeout(timer);
-        const match = output.match(/Accepted (\d+) events/);
-        const accepted = match ? Number(match[1]) : 0;
-        // 采集完成后主动推送飞书签名
-        const pushResult = await refreshFeishuPreview(device.id, 'manual_collect').catch(() => ({ status: 'skipped' }));
-        console.log(`[Collect] done code=${code} accepted=${accepted} feishu=${pushResult.status}`);
-        resolve(json(response, code === 0 ? 200 : 500, { ok: code === 0, accepted, output: output.trim(), feishu_push: pushResult.status }));
-      });
-    });
+    
+    const clients = state.daemonStreams.get(device.id);
+    if (!clients || clients.size === 0) {
+      return json(response, 404, { ok: false, error: '设备不在线，请确保本地已运行 token-tide daemon' });
+    }
+
+    // 向所有该设备的在线客户端广播 collect_now
+    for (const client of clients) {
+      client.write(`data: ${JSON.stringify({ type: 'collect_now' })}\n\n`);
+    }
+
+    // 不再等待同步结果，直接返回让前端知道指令已下发
+    // 实际上传会在几秒后触发 POST /batch
+    return json(response, 200, { ok: true, message: '采集指令已下发给在线设备' });
   }
 
   return false;
@@ -934,7 +1120,9 @@ const server = createServer(async (request, response) => {
       remember(state.signatureRequests, { at: new Date().toISOString(), device_id: deviceId, feishu_id: feishuId, user_agent: request.headers['user-agent'] || 'unknown', cf_ray: request.headers['cf-ray'] || null });
       const config = deviceId ? getDeviceConfig(deviceId) : state.signatureConfig;
       const today = dateKey(new Date());
-      const canonicalKey = feishuId || deviceId;
+      const unionId = config.feishu_identity?.union_id;
+      const openId = config.feishu_identity?.open_id;
+      const canonicalKey = unionId || openId || feishuId || deviceId;
       const sourceEvents = canonicalKey
         ? state.events.filter(item => {
             const fi = getDeviceConfig(item.deviceId).feishu_identity;
@@ -945,8 +1133,8 @@ const server = createServer(async (request, response) => {
         : state.events;
       const items = config.metric === 'today' ? sourceEvents.filter((item) => dateKey(item.event.occurred_at) === today) : sourceEvents;
       const row = canonicalKey
-        ? (leaderboard(items).find(r => r.canonical_key === canonicalKey || r.device_id === deviceId) || null)
-        : (leaderboard(items)[0] || null);
+        ? signatureRow(items, r => r.canonical_key === canonicalKey || r.device_id === deviceId)
+        : signatureRow(items);
 
       const text = buildSignatureText(row, config.metric, config.last_collect_at);
 
@@ -1225,6 +1413,7 @@ const appId = feishuAppId;
 const appSecret = feishuAppSecret;
 
 if (appId && appSecret) {
+  
   try {
     console.log(`[Feishu WSClient] Attempting to connect Lark WebSocket with App ID: ${appId}`);
     // 动态引入 SDK，避免在未安装 SDK 时启动报错
@@ -1243,8 +1432,17 @@ if (appId && appSecret) {
               const previewToken = event.context.preview_token;
               const targetUrlStr = event.context.url;
               let previewDeviceId = null;
-              try { previewDeviceId = new URL(targetUrlStr).searchParams.get('device_id'); } catch {}
-              addPreviewToken(previewDeviceId || 'default', previewToken);
+              try {
+                const targetUrl = new URL(targetUrlStr);
+                previewDeviceId = targetUrl.searchParams.get('device_id');
+                if (!previewDeviceId) {
+                  const feishuId = targetUrl.searchParams.get('feishu_id');
+                  if (feishuId) {
+                    previewDeviceId = findDeviceByFeishuId(feishuId, true) || findDeviceByFeishuId(feishuId, false);
+                  }
+                }
+              } catch {}
+              addPreviewToken(previewDeviceId || 'default', previewToken, targetUrlStr);
               const responseData = generateLinkPreviewResponse(targetUrlStr, previewToken);
               console.log(`[Link Preview - WebSocket] Replied successfully | Text: ${responseData.inline.title}`);
               return responseData;

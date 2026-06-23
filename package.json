@@ -8,8 +8,8 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "node --env-file-if-exists=.env --watch apps/server/src/server.mjs",
-    "start": "node --env-file-if-exists=.env apps/server/src/server.mjs",
+    "dev": "node --experimental-sqlite --env-file-if-exists=.env --watch apps/server/src/server.mjs",
+    "start": "node --experimental-sqlite --env-file-if-exists=.env apps/server/src/server.mjs",
     "collector": "node apps/collector/src/cli.mjs",
     "demo:sync": "node apps/collector/src/cli.mjs demo-sync",
     "test": "node --test",
